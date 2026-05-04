@@ -84,7 +84,7 @@ When leaving plan mode, the extension notifies:
 Plan mode ended
 ```
 
-If you leave plan mode while the agent is idle and the latest message is from the assistant, it waits 2 seconds and then sends this user message automatically:
+If you leave plan mode while the agent is idle, the latest message is from the assistant, and this session has already received the plan-mode instruction message, it waits 2 seconds and then sends this user message automatically:
 
 ```text
 Plan mode ended. Execute the plan.
@@ -112,9 +112,10 @@ A safer bypass mode intended for local app debugging.
 - Still blocks catastrophic commands and protected paths.
 - Allows writes only inside the current working directory or its parent directory.
 - Blocks `git push`.
-- Blocks PR creation commands like `gh pr create`.
-- Allows network-ish bash commands only when they target localhost on port `3000` or `8080`.
-- Blocks common external-network commands such as `curl`, `wget`, package install/search commands, `gh api`, `ssh`, `scp`, and similar unless they clearly target an allowed localhost port.
+- Blocks PR creation and mutation commands like `gh pr create` / `gh pr merge`.
+- Blocks common GitHub mutation commands, package publishing, and `git push`.
+- Allows network-ish bash commands only when they target localhost on port `3000` or `8080`, or a read-only GitHub operation.
+- Sends the mode `description` to the model as permission context, so custom modes can explain their rules.
 
 ## Shortcut and command
 
@@ -152,6 +153,7 @@ Set this in `~/.pi/agent/settings.json` or project-local `.pi/settings.json`:
           ],
           "network": {
             "allowLocalhostOnly": true,
+            "allowGithubReadOnly": true,
             "allowedPorts": [3000, 8080]
           }
         }
@@ -173,7 +175,10 @@ Set this in `~/.pi/agent/settings.json` or project-local `.pi/settings.json`:
 - `allowedWriteRoots`: write/edit roots. Supports `"cwd"`, `"parent"`, absolute paths, and `~/...` paths.
 - `blockedBashPatterns`: regex-like bash patterns with descriptions.
 - `network.allowLocalhostOnly`: when true, network-like bash commands are blocked unless they target localhost.
+- `network.allowGithubReadOnly`: when true, read-only GitHub commands/URLs are also allowed.
 - `network.allowedPorts`: optional allowed localhost ports.
+
+For custom modes with a policy, `description` is also injected into the model context while that mode is active.
 
 ## Safety checks kept from the inspiration plugin
 

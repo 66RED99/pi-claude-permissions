@@ -36,6 +36,7 @@ interface CustomModePolicy {
   blockedBashPatterns?: Pattern[];
   network?: {
     allowLocalhostOnly?: boolean;
+    allowGithubReadOnly?: boolean;
     allowedPorts?: number[];
   };
 }
@@ -91,9 +92,14 @@ const SAFE_BYPASS_MODE: ModeDefinition = {
       { pattern: "\\bgit\\s+push\\b", description: "git push is blocked in Safe Bypass" },
       { pattern: "\\bgh\\s+pr\\s+create\\b", description: "PR creation is blocked in Safe Bypass" },
       { pattern: "\\bpr\\s+create\\b", description: "PR creation is blocked in Safe Bypass" },
+      { pattern: "\\bgh\\s+pr\\s+(merge|close|edit|ready|reopen|lock|unlock)\\b", description: "PR mutation is blocked in Safe Bypass" },
+      { pattern: "\\bgh\\s+(repo|release|workflow|run|secret|variable|label|auth)\\s+(create|delete|edit|rename|transfer|archive|fork|upload|run|rerun|cancel|watch|unwatch|star|unstar|set|remove|login|logout|refresh)\\b", description: "GitHub mutation is blocked in Safe Bypass" },
+      { pattern: "\\bgh\\s+api\\b(?![^|;&]*\\b-X\\s+GET\\b)", description: "gh api is blocked unless it is explicitly read-only with -X GET" },
+      { pattern: "\\b(?:npm|pnpm|yarn|bun)\\s+publish\\b", description: "Package publishing is blocked in Safe Bypass" },
     ],
     network: {
       allowLocalhostOnly: true,
+      allowGithubReadOnly: true,
       allowedPorts: [3000, 8080],
     },
   },
@@ -224,6 +230,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
         && ctx.isIdle?.() === true
         && ctx.hasPendingMessages?.() !== true
         && hasPriorAssistantResponse(ctx)
+        && hasPlanModeContextMessage(ctx)
       ) {
         pi.sendUserMessage(PLAN_EXIT_PROMPT);
       }
@@ -237,7 +244,8 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     const shouldExecutePlan = leavingPlan
       && ctx.isIdle?.() === true
       && ctx.hasPendingMessages?.() !== true
-      && hasPriorAssistantResponse(ctx);
+      && hasPriorAssistantResponse(ctx)
+      && hasPlanModeContextMessage(ctx);
 
     if (nextMode === "plan") {
       cancelPlanExitTimer();
@@ -310,12 +318,23 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async () => {
-    if (mode !== "plan" || !planContextPending) return;
-    planContextPending = false;
+    if (mode === "plan" && planContextPending) {
+      planContextPending = false;
+      return {
+        message: {
+          customType: "plan-mode-context",
+          content: PLAN_MODE_MESSAGE,
+          display: true,
+        },
+      };
+    }
+
+    const modeMeta = getModeMeta(mode, modes);
+    if (!modeMeta.policy || !modeMeta.description) return;
     return {
       message: {
-        customType: "plan-mode-context",
-        content: PLAN_MODE_MESSAGE,
+        customType: "permission-mode-context",
+        content: `[${modeMeta.label.toUpperCase()} MODE ACTIVE]\n${modeMeta.description}`,
         display: true,
       },
     };
@@ -442,6 +461,7 @@ function normalizeCustomModePolicy(raw: Record<string, any>): CustomModePolicy |
   if (raw.network && typeof raw.network === "object") {
     policy.network = {
       allowLocalhostOnly: raw.network.allowLocalhostOnly === true,
+      allowGithubReadOnly: raw.network.allowGithubReadOnly === true,
       allowedPorts: Array.isArray(raw.network.allowedPorts)
         ? raw.network.allowedPorts.filter((port: unknown): port is number => Number.isInteger(port))
         : undefined,
@@ -559,11 +579,13 @@ function findNetworkBlock(command: string, network: CustomModePolicy["network"])
 
   const urls = extractUrls(command);
   for (const url of urls) {
-    if (!isAllowedLocalUrl(url, network.allowedPorts)) {
-      return `Network request blocked outside allowed localhost ports: ${url}`;
+    if (!isAllowedLocalUrl(url, network.allowedPorts) && !isAllowedGithubReadUrl(url, network.allowGithubReadOnly)) {
+      return `Network request blocked outside allowed localhost ports/GitHub read-only access: ${url}`;
     }
   }
 
+  if (isAllowedGithubReadCommand(command, network.allowGithubReadOnly)) return;
+  if (hasExternalNetworkIntent(command)) return "Network command blocked unless it targets localhost or a read-only GitHub operation.";
   if (!isNetworkCommand(command)) return;
   const localRefs = extractLocalhostRefs(command);
   if (localRefs.length === 0) return "Network command blocked unless it targets an allowed localhost port.";
@@ -587,8 +609,26 @@ function extractLocalhostRefs(command: string): Array<{ raw: string; port?: numb
 
 function isNetworkCommand(command: string): boolean {
   return /\b(curl|wget|http|httpie|nc|netcat|telnet|ssh|scp|rsync|gh\s+api)\b/i.test(command)
-    || /\b(npm|pnpm|yarn|bun)\s+(install|add|view|info|search|audit|outdated)\b/i.test(command)
+    || /\b(?:node|python|python3|ruby|perl|php|deno|bun)\b[^|;&]*(?:fetch|request|requests|urllib|http|https|socket|net\.)/i.test(command)
+    || /\b(npm|pnpm|yarn|bun)\s+(install|add|view|info|search|audit|outdated|publish)\b/i.test(command)
     || /\bpip\s+install\b/i.test(command);
+}
+
+function hasExternalNetworkIntent(command: string): boolean {
+  return /\b(?:ssh|scp|rsync)\s+(?!.*(?:localhost|127\.0\.0\.1|\[?::1\]?))/i.test(command)
+    || /\b(?:git\s+(?:clone|fetch|pull|ls-remote)|gh\s+|npm\s+|pnpm\s+|yarn\s+|bun\s+|pip\s+)/i.test(command);
+}
+
+function isAllowedGithubReadCommand(command: string, allowGithubReadOnly?: boolean): boolean {
+  if (!allowGithubReadOnly) return false;
+  const trimmed = command.trim();
+  return /\bgh\s+pr\s+(view|list|diff|checks|status)\b/i.test(trimmed)
+    || /\bgh\s+issue\s+(view|list|status)\b/i.test(trimmed)
+    || /\bgh\s+repo\s+view\b/i.test(trimmed)
+    || /\bgh\s+run\s+(view|list)\b/i.test(trimmed)
+    || /\bgh\s+release\s+(view|list)\b/i.test(trimmed)
+    || /\bgh\s+api\b[^|;&]*\b-X\s+GET\b/i.test(trimmed)
+    || /\bgit\s+(?:fetch|pull|ls-remote)\b[^|;&]*(?:github\.com[:/]|https:\/\/github\.com\/)/i.test(trimmed);
 }
 
 function isAllowedLocalUrl(rawUrl: string, allowedPorts?: number[]): boolean {
@@ -598,6 +638,17 @@ function isAllowedLocalUrl(rawUrl: string, allowedPorts?: number[]): boolean {
     if (host !== "localhost" && host !== "127.0.0.1" && host !== "[::1]" && host !== "::1") return false;
     const port = url.port ? Number(url.port) : undefined;
     return isAllowedLocalPort(port, allowedPorts);
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedGithubReadUrl(rawUrl: string, allowGithubReadOnly?: boolean): boolean {
+  if (!allowGithubReadOnly) return false;
+  try {
+    const url = new URL(rawUrl);
+    const host = url.hostname.toLowerCase();
+    return host === "github.com" || host.endsWith(".github.com") || host === "api.github.com";
   } catch {
     return false;
   }
@@ -677,6 +728,18 @@ function hasLatestPlanExitPrompt(ctx: UiContext): boolean {
     return entry.message?.role === "user" && getMessageText(entry.message?.content) === PLAN_EXIT_PROMPT;
   }
   return false;
+}
+
+function hasPlanModeContextMessage(ctx: UiContext): boolean {
+  return (ctx.sessionManager?.getEntries?.() ?? []).some((entry) => {
+    if (entry?.type === "custom_message") {
+      return entry.customType === "plan-mode-context" && getMessageText(entry.content) === PLAN_MODE_MESSAGE;
+    }
+    if (entry?.type === "message" && entry.message?.role === "custom") {
+      return entry.message.customType === "plan-mode-context" && getMessageText(entry.message.content) === PLAN_MODE_MESSAGE;
+    }
+    return false;
+  });
 }
 
 function getMessageText(content: unknown): string {
