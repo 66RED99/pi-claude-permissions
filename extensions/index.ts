@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-type PermissionMode = "default" | "plan" | "acceptEdits" | "bypassPermissions";
+type PermissionMode = string;
 type Pattern = { pattern: string; description: string };
 type UiContext = {
   ui: any;
@@ -21,12 +21,31 @@ type UiContext = {
   isIdle?: () => boolean;
   abort?: () => void;
   hasPendingMessages?: () => boolean;
+  cwd?: string;
   sessionManager?: { getEntries?: () => Array<any> };
 };
 
 interface SessionAllow {
   tools: Set<string>;
   commands: Set<string>;
+}
+
+interface CustomModePolicy {
+  excludedTools?: string[];
+  allowedWriteRoots?: Array<"cwd" | "parent" | string>;
+  blockedBashPatterns?: Pattern[];
+  network?: {
+    allowLocalhostOnly?: boolean;
+    allowedPorts?: number[];
+  };
+}
+
+interface ModeDefinition {
+  id: PermissionMode;
+  label: string;
+  description: string;
+  status: string;
+  policy?: CustomModePolicy;
 }
 
 interface PermissionsConfig {
@@ -37,6 +56,7 @@ interface PermissionsConfig {
   allowCatastrophic?: boolean;
   shiftTabOptions?: string[];
   defaultMode?: string;
+  customModes?: ModeDefinition[];
 }
 
 interface PiSettingsConfig {
@@ -44,6 +64,7 @@ interface PiSettingsConfig {
     allowCatastrophic?: boolean;
     shiftTabOptions?: string[];
     defaultMode?: string;
+    customModes?: ModeDefinition[];
   };
 }
 
@@ -51,12 +72,32 @@ const DEFAULT_MODE: PermissionMode = "bypassPermissions";
 const PLAN_EXIT_PROMPT = "Plan mode ended. Execute the plan.";
 const PLAN_BLOCK_REASON = "You are in plan mode, you can only read files/search tools until the user exits plan mode.";
 
-const MODES: Array<{ id: PermissionMode; label: string; description: string; status: string }> = [
+const BUILT_IN_MODES: ModeDefinition[] = [
   { id: "default", label: "Default", description: "Ask before write/edit/bash operations", status: "⏵" },
   { id: "plan", label: "Plan", description: "Read-only exploration; only read/search tools and safe bash", status: "⏸" },
   { id: "acceptEdits", label: "Accept Edits", description: "Allow write/edit silently, confirm bash", status: "⏵⏵" },
   { id: "bypassPermissions", label: "Bypass Permissions", description: "Allow everything except catastrophic/protected operations", status: "⏵⏵⏵⏵" },
 ];
+
+const SAFE_BYPASS_MODE: ModeDefinition = {
+  id: "safeBypass",
+  label: "Safe Bypass",
+  description: "Allow local project work, block publishing and external network access",
+  status: "⏵⛨",
+  policy: {
+    excludedTools: [],
+    allowedWriteRoots: ["cwd", "parent"],
+    blockedBashPatterns: [
+      { pattern: "\\bgit\\s+push\\b", description: "git push is blocked in Safe Bypass" },
+      { pattern: "\\bgh\\s+pr\\s+create\\b", description: "PR creation is blocked in Safe Bypass" },
+      { pattern: "\\bpr\\s+create\\b", description: "PR creation is blocked in Safe Bypass" },
+    ],
+    network: {
+      allowLocalhostOnly: true,
+      allowedPorts: [3000, 8080],
+    },
+  },
+};
 
 const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "rg", "fd", "bat", "eza"];
 const GATED_TOOLS = new Set(["write", "edit", "bash"]);
@@ -139,10 +180,11 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     path.startsWith("~/") ? resolve(home, path.slice(2)) : resolve(path),
   );
   const allowCatastrophic = config.allowCatastrophic === true;
-  const shiftTabModes = normalizeShiftTabOptions(config.shiftTabOptions);
-  const defaultMode = normalizeMode(config.defaultMode);
+  const modes = buildModeDefinitions(config.customModes);
+  const defaultMode = normalizeMode(config.defaultMode, DEFAULT_MODE, modes);
+  const shiftTabModes = normalizeShiftTabOptions(config.shiftTabOptions, modes);
 
-  let mode = normalizeMode(config.mode, defaultMode);
+  let mode = normalizeMode(config.mode, defaultMode, modes);
   let previousActiveTools: string[] | null = null;
   let planContextPending = mode === "plan";
   let planExitTimer: ReturnType<typeof setTimeout> | null = null;
@@ -164,7 +206,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   };
 
   const updateStatus = (ctx: UiContext) => {
-    const meta = getModeMeta(mode);
+    const meta = getModeMeta(mode, modes);
     ctx.ui.setStatus("permissions", `${meta.status} ${meta.label}`);
   };
 
@@ -215,7 +257,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
         planContextPending = false;
         ctx.ui.notify("Plan mode ended", "info");
       }
-      ctx.ui.notify(`Permission mode: ${getModeMeta(mode).label}`, "info");
+      ctx.ui.notify(`Permission mode: ${getModeMeta(mode, modes).label}`, "info");
     }
 
     updateStatus(ctx);
@@ -230,7 +272,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
       mode = "bypassPermissions";
     } else {
       const flagMode = pi.getFlag("permission-mode");
-      if (typeof flagMode === "string" && flagMode) mode = normalizeMode(flagMode, defaultMode);
+      if (typeof flagMode === "string" && flagMode) mode = normalizeMode(flagMode, defaultMode, modes);
     }
 
     if (mode === "plan") {
@@ -245,7 +287,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   });
 
   pi.registerShortcut("shift+tab", {
-    description: `Cycle permission mode (${shiftTabModes.map((m) => getModeMeta(m).label).join(" → ")})`,
+    description: `Cycle permission mode (${shiftTabModes.map((m) => getModeMeta(m, modes).label).join(" → ")})`,
     handler: async (ctx) => {
       const idx = shiftTabModes.findIndex((m) => m === mode);
       applyMode(shiftTabModes[(idx + 1) % shiftTabModes.length]!, ctx);
@@ -260,10 +302,10 @@ export default async function permissionExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const options = MODES.map((m) => `${m.label} — ${m.description}`);
+      const options = modes.map((m) => `${m.label} — ${m.description}`);
       const selected = await ctx.ui.select("Select permission mode", options);
       const idx = selected ? options.indexOf(selected) : -1;
-      if (idx >= 0) applyMode(MODES[idx]!.id, ctx);
+      if (idx >= 0) applyMode(modes[idx]!.id, ctx);
     },
   });
 
@@ -283,7 +325,9 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     const toolName = event.toolName;
 
     if (mode === "plan") return enforcePlanMode(toolName, event.input);
-    if (mode !== "default" && !GATED_TOOLS.has(toolName)) return;
+    const modeMeta = getModeMeta(mode, modes);
+    const customPolicy = modeMeta.policy;
+    if (!customPolicy && mode !== "default" && !GATED_TOOLS.has(toolName)) return;
 
     const safetyBlock = await enforceAlwaysOnSafety({
       toolName,
@@ -296,6 +340,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     });
     if (safetyBlock) return safetyBlock;
 
+    if (customPolicy) return enforceCustomMode(toolName, event.input, ctx, customPolicy);
     if (mode === "bypassPermissions") return;
     if (mode === "acceptEdits" && (toolName === "write" || toolName === "edit")) return;
 
@@ -320,7 +365,7 @@ async function loadConfig(): Promise<PermissionsConfig> {
   const localSettings = await readJson<PiSettingsConfig>(localSettingsPath);
 
   return {
-    mode: normalizeMode(local.mode ?? global.mode),
+    mode: stringOrUndefined(local.mode ?? global.mode),
     dangerousPatterns: local.dangerousPatterns ?? global.dangerousPatterns ?? DEFAULT_DANGEROUS,
     catastrophicPatterns: local.catastrophicPatterns ?? global.catastrophicPatterns ?? DEFAULT_CATASTROPHIC,
     protectedPaths: local.protectedPaths ?? global.protectedPaths ?? DEFAULT_PROTECTED_PATHS,
@@ -331,10 +376,14 @@ async function loadConfig(): Promise<PermissionsConfig> {
       ?? globalSettings.piClaudePermissions?.shiftTabOptions
       ?? local.shiftTabOptions
       ?? global.shiftTabOptions,
-    defaultMode: localSettings.piClaudePermissions?.defaultMode
+    defaultMode: stringOrUndefined(localSettings.piClaudePermissions?.defaultMode
       ?? globalSettings.piClaudePermissions?.defaultMode
       ?? local.defaultMode
-      ?? global.defaultMode,
+      ?? global.defaultMode),
+    customModes: localSettings.piClaudePermissions?.customModes
+      ?? globalSettings.piClaudePermissions?.customModes
+      ?? local.customModes
+      ?? global.customModes,
   };
 }
 
@@ -346,26 +395,82 @@ async function readJson<T>(path: string): Promise<T | Record<string, never>> {
   }
 }
 
-function normalizeMode(mode: unknown, fallback: PermissionMode = DEFAULT_MODE): PermissionMode {
-  return parseMode(mode) ?? fallback;
+function stringOrUndefined(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function parseMode(mode: unknown): PermissionMode | undefined {
-  if (mode === "default" || mode === "plan" || mode === "acceptEdits" || mode === "bypassPermissions") return mode;
+function buildModeDefinitions(customModes: unknown): ModeDefinition[] {
+  const modes = [...BUILT_IN_MODES, SAFE_BYPASS_MODE];
+  if (!Array.isArray(customModes)) return modes;
+
+  for (const customMode of customModes) {
+    const mode = normalizeCustomMode(customMode);
+    if (!mode) continue;
+    const existing = modes.findIndex((candidate) => candidate.id === mode.id);
+    if (existing >= 0) modes[existing] = mode;
+    else modes.push(mode);
+  }
+
+  return modes;
 }
 
-function normalizeShiftTabOptions(options: unknown): PermissionMode[] {
-  if (!Array.isArray(options)) return MODES.map((mode) => mode.id);
+function normalizeCustomMode(value: unknown): ModeDefinition | undefined {
+  if (!value || typeof value !== "object") return;
+  const raw = value as Record<string, any>;
+  const id = stringOrUndefined(raw.id);
+  const label = stringOrUndefined(raw.label);
+  if (!id || !label) return;
+
+  return {
+    id,
+    label,
+    description: stringOrUndefined(raw.description) ?? label,
+    status: stringOrUndefined(raw.status) ?? "⏵",
+    policy: normalizeCustomModePolicy(raw.policy ?? raw),
+  };
+}
+
+function normalizeCustomModePolicy(raw: Record<string, any>): CustomModePolicy | undefined {
+  const policy: CustomModePolicy = {};
+  if (Array.isArray(raw.excludedTools)) policy.excludedTools = raw.excludedTools.filter((tool: unknown): tool is string => typeof tool === "string");
+  if (Array.isArray(raw.allowedWriteRoots)) policy.allowedWriteRoots = raw.allowedWriteRoots.filter((root: unknown): root is string => typeof root === "string");
+  if (Array.isArray(raw.blockedBashPatterns)) {
+    policy.blockedBashPatterns = raw.blockedBashPatterns
+      .filter((pattern: unknown): pattern is Pattern => Boolean(pattern) && typeof pattern === "object" && typeof (pattern as Pattern).pattern === "string")
+      .map((pattern: Pattern) => ({ pattern: pattern.pattern, description: pattern.description ?? pattern.pattern }));
+  }
+  if (raw.network && typeof raw.network === "object") {
+    policy.network = {
+      allowLocalhostOnly: raw.network.allowLocalhostOnly === true,
+      allowedPorts: Array.isArray(raw.network.allowedPorts)
+        ? raw.network.allowedPorts.filter((port: unknown): port is number => Number.isInteger(port))
+        : undefined,
+    };
+  }
+  return Object.keys(policy).length > 0 ? policy : undefined;
+}
+
+function normalizeMode(mode: unknown, fallback: PermissionMode = DEFAULT_MODE, modes: ModeDefinition[] = [...BUILT_IN_MODES, SAFE_BYPASS_MODE]): PermissionMode {
+  return parseMode(mode, modes) ?? fallback;
+}
+
+function parseMode(mode: unknown, modes: ModeDefinition[]): PermissionMode | undefined {
+  if (typeof mode !== "string") return;
+  if (modes.some((candidate) => candidate.id === mode)) return mode;
+}
+
+function normalizeShiftTabOptions(options: unknown, allModes: ModeDefinition[]): PermissionMode[] {
+  if (!Array.isArray(options)) return allModes.map((mode) => mode.id);
 
   const modes = options
-    .map((option) => parseMode(option))
+    .map((option) => parseMode(option, allModes))
     .filter((mode): mode is PermissionMode => mode !== undefined)
     .filter((mode, index, all) => all.indexOf(mode) === index);
-  return modes.length > 0 ? modes : MODES.map((mode) => mode.id);
+  return modes.length > 0 ? modes : allModes.map((mode) => mode.id);
 }
 
-function getModeMeta(mode: PermissionMode) {
-  return MODES.find((m) => m.id === mode)!;
+function getModeMeta(mode: PermissionMode, modes: ModeDefinition[]) {
+  return modes.find((m) => m.id === mode) ?? modes.find((m) => m.id === DEFAULT_MODE)!;
 }
 
 function enforcePlanMode(toolName: string, input: Record<string, unknown>) {
@@ -373,6 +478,134 @@ function enforcePlanMode(toolName: string, input: Record<string, unknown>) {
   if (toolName === "bash" && !isSafePlanCommand(String(input.command ?? ""))) {
     return { block: true as const, reason: PLAN_BLOCK_REASON };
   }
+}
+
+function enforceCustomMode(toolName: string, input: Record<string, unknown>, ctx: UiContext, policy: CustomModePolicy) {
+  if (policy.excludedTools?.includes(toolName)) {
+    return { block: true as const, reason: `${toolName} is blocked in this permission mode.` };
+  }
+
+  if (toolName === "write" || toolName === "edit") {
+    const targetPath = resolve(String(input.path ?? ""));
+    if (!isPathInAllowedRoots(targetPath, ctx, policy.allowedWriteRoots)) {
+      return { block: true as const, reason: `Write blocked outside allowed roots: ${targetPath}` };
+    }
+  }
+
+  if (toolName === "bash") {
+    const command = String(input.command ?? "");
+    const blockedPattern = findCommandPatternMatch(command, policy.blockedBashPatterns ?? []);
+    if (blockedPattern) {
+      return { block: true as const, reason: blockedPattern.description };
+    }
+
+    const pathBlock = findBashPathBlock(command, ctx, policy.allowedWriteRoots);
+    if (pathBlock) return { block: true as const, reason: pathBlock };
+
+    const networkBlock = findNetworkBlock(command, policy.network);
+    if (networkBlock) return { block: true as const, reason: networkBlock };
+  }
+}
+
+function isPathInAllowedRoots(targetPath: string, ctx: UiContext, roots: CustomModePolicy["allowedWriteRoots"]): boolean {
+  if (!roots || roots.length === 0) return true;
+  return getAllowedRoots(ctx, roots).some((root) => targetPath === root || targetPath.startsWith(root + "/"));
+}
+
+function getAllowedRoots(ctx: UiContext, roots: CustomModePolicy["allowedWriteRoots"]): string[] {
+  const cwd = resolve(ctx.cwd ?? process.cwd());
+  return (roots ?? []).map((root) => {
+    if (root === "cwd") return cwd;
+    if (root === "parent") return resolve(cwd, "..");
+    if (root.startsWith("~/")) return resolve(homedir(), root.slice(2));
+    return resolve(root);
+  });
+}
+
+function findBashPathBlock(command: string, ctx: UiContext, roots: CustomModePolicy["allowedWriteRoots"]): string | undefined {
+  if (!roots || roots.length === 0) return;
+  const allowedRoots = getAllowedRoots(ctx, roots);
+  const cwd = resolve(ctx.cwd ?? process.cwd());
+  const pathPattern = /(?:^|\s)(~\/?[^\s;&|]*|\.\.?\/?[^\s;&|]*|\/[^\s;&|]*)/g;
+  for (const match of command.matchAll(pathPattern)) {
+    const token = match[1]?.replace(/["']+$/g, "");
+    if (!token || token === "." || token === ".." || token.startsWith("/-")) continue;
+    if (token.startsWith("/dev/")) continue;
+
+    const resolved = token.startsWith("~/") || token === "~"
+      ? resolve(homedir(), token === "~" ? "" : token.slice(2))
+      : token.startsWith("/")
+        ? resolve(token)
+        : resolve(cwd, token);
+
+    if (!allowedRoots.some((root) => resolved === root || resolved.startsWith(root + "/"))) {
+      return `Bash path blocked outside allowed roots: ${token}`;
+    }
+  }
+}
+
+function findCommandPatternMatch(command: string, patterns: Pattern[]): Pattern | undefined {
+  return patterns.find((pattern) => {
+    try {
+      return new RegExp(pattern.pattern).test(command);
+    } catch {
+      return command.includes(pattern.pattern);
+    }
+  });
+}
+
+function findNetworkBlock(command: string, network: CustomModePolicy["network"]): string | undefined {
+  if (!network?.allowLocalhostOnly) return;
+
+  const urls = extractUrls(command);
+  for (const url of urls) {
+    if (!isAllowedLocalUrl(url, network.allowedPorts)) {
+      return `Network request blocked outside allowed localhost ports: ${url}`;
+    }
+  }
+
+  if (!isNetworkCommand(command)) return;
+  const localRefs = extractLocalhostRefs(command);
+  if (localRefs.length === 0) return "Network command blocked unless it targets an allowed localhost port.";
+  for (const ref of localRefs) {
+    if (!isAllowedLocalPort(ref.port, network.allowedPorts)) {
+      return `Network request blocked outside allowed localhost ports: ${ref.raw}`;
+    }
+  }
+}
+
+function extractUrls(command: string): string[] {
+  return Array.from(command.matchAll(/https?:\/\/[^\s'"`<>]+/gi), (match) => match[0]);
+}
+
+function extractLocalhostRefs(command: string): Array<{ raw: string; port?: number }> {
+  return Array.from(command.matchAll(/\b(?:localhost|127\.0\.0\.1|\[?::1\]?)(?::(\d+))?\b/gi), (match) => ({
+    raw: match[0],
+    port: match[1] ? Number(match[1]) : undefined,
+  }));
+}
+
+function isNetworkCommand(command: string): boolean {
+  return /\b(curl|wget|http|httpie|nc|netcat|telnet|ssh|scp|rsync|gh\s+api)\b/i.test(command)
+    || /\b(npm|pnpm|yarn|bun)\s+(install|add|view|info|search|audit|outdated)\b/i.test(command)
+    || /\bpip\s+install\b/i.test(command);
+}
+
+function isAllowedLocalUrl(rawUrl: string, allowedPorts?: number[]): boolean {
+  try {
+    const url = new URL(rawUrl);
+    const host = url.hostname.toLowerCase();
+    if (host !== "localhost" && host !== "127.0.0.1" && host !== "[::1]" && host !== "::1") return false;
+    const port = url.port ? Number(url.port) : undefined;
+    return isAllowedLocalPort(port, allowedPorts);
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedLocalPort(port: number | undefined, allowedPorts?: number[]): boolean {
+  if (!allowedPorts || allowedPorts.length === 0) return true;
+  return port !== undefined && allowedPorts.includes(port);
 }
 
 async function enforceAlwaysOnSafety(args: {

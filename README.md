@@ -10,11 +10,13 @@ This is heavily based on and inspired by [`rHedBull/pi-permissions`](https://git
 
 ## What is different?
 
-- **Four modes**:
+- **Built-in modes**:
   - `default`
   - `plan`
   - `acceptEdits`
   - `bypassPermissions`
+  - `safeBypass`
+- **Custom modes** via `piClaudePermissions.customModes`.
 - **No `fullAuto` mode**.
 - **`bypassPermissions` is the startup default**.
 - **Configurable `Shift+Tab` cycle**.
@@ -82,11 +84,13 @@ When leaving plan mode, the extension notifies:
 Plan mode ended
 ```
 
-If you leave plan mode while the agent is idle and there is already at least one assistant response in the session, it sends this user message automatically:
+If you leave plan mode while the agent is idle and the latest message is from the assistant, it waits 2 seconds and then sends this user message automatically:
 
 ```text
 Plan mode ended. Execute the plan.
 ```
+
+If you cycle back into plan mode within those 2 seconds, the pending execute message is cancelled. If the execute message already started and you cycle back into plan mode, the extension aborts the current run like pressing Escape.
 
 ### `acceptEdits`
 
@@ -100,12 +104,24 @@ Plan mode ended. Execute the plan.
 - Still blocks catastrophic commands and protected paths.
 - This is the default mode.
 
+### `safeBypass`
+
+A safer bypass mode intended for local app debugging.
+
+- Allows normal operations without confirmation.
+- Still blocks catastrophic commands and protected paths.
+- Allows writes only inside the current working directory or its parent directory.
+- Blocks `git push`.
+- Blocks PR creation commands like `gh pr create`.
+- Allows network-ish bash commands only when they target localhost on port `3000` or `8080`.
+- Blocks common external-network commands such as `curl`, `wget`, package install/search commands, `gh api`, `ssh`, `scp`, and similar unless they clearly target an allowed localhost port.
+
 ## Shortcut and command
 
 By default, `Shift+Tab` cycles all modes:
 
 ```text
-default → plan → acceptEdits → bypassPermissions → default
+default → plan → acceptEdits → bypassPermissions → safeBypass → default
 ```
 
 Use `/permissions` to manually select any mode at any time. If you rarely use one of the modes, set `piClaudePermissions.shiftTabOptions` to keep your `Shift+Tab` cycle faster; `/permissions` will still show all modes.
@@ -119,16 +135,45 @@ Set this in `~/.pi/agent/settings.json` or project-local `.pi/settings.json`:
   "piClaudePermissions": {
     "defaultMode": "bypassPermissions",
     "allowCatastrophic": false,
-    "shiftTabOptions": ["default", "plan", "acceptEdits", "bypassPermissions"]
+    "shiftTabOptions": ["default", "plan", "acceptEdits", "bypassPermissions", "safeBypass"],
+    "customModes": [
+      {
+        "id": "localOnly",
+        "label": "Local Only",
+        "description": "Allow local writes and localhost debugging only",
+        "status": "⏵⛨",
+        "policy": {
+          "excludedTools": [],
+          "allowedWriteRoots": ["cwd", "parent"],
+          "blockedBashPatterns": [
+            { "pattern": "\\bgit\\s+push\\b", "description": "git push is blocked" },
+            { "pattern": "\\bgh\\s+pr\\s+create\\b", "description": "PR creation is blocked" },
+            { "pattern": "\\bpr\\s+create\\b", "description": "PR creation is blocked" }
+          ],
+          "network": {
+            "allowLocalhostOnly": true,
+            "allowedPorts": [3000, 8080]
+          }
+        }
+      }
+    ]
   }
 }
 ```
 
-`defaultMode` controls the startup mode and defaults to `bypassPermissions`. Valid values are `default`, `plan`, `acceptEdits`, and `bypassPermissions`.
+`defaultMode` controls the startup mode and defaults to `bypassPermissions`. Valid values are any built-in or custom mode id. Built-ins are `default`, `plan`, `acceptEdits`, `bypassPermissions`, and `safeBypass`.
 
 `allowCatastrophic` defaults to `false`. When set to `true`, catastrophic command blocking and critical `rm -rf` detection are allowed. Protected path checks still run.
 
-`shiftTabOptions` defaults to all modes. Valid values are `default`, `plan`, `acceptEdits`, and `bypassPermissions`. This only changes the `Shift+Tab` cycle; `/permissions` still lists every mode.
+`shiftTabOptions` defaults to all built-in and custom modes. Valid values are any built-in or custom mode id. This only changes the `Shift+Tab` cycle; `/permissions` still lists every mode.
+
+`customModes` adds or overrides mode definitions. A custom mode can define a `policy` with:
+
+- `excludedTools`: tool names to block outright.
+- `allowedWriteRoots`: write/edit roots. Supports `"cwd"`, `"parent"`, absolute paths, and `~/...` paths.
+- `blockedBashPatterns`: regex-like bash patterns with descriptions.
+- `network.allowLocalhostOnly`: when true, network-like bash commands are blocked unless they target localhost.
+- `network.allowedPorts`: optional allowed localhost ports.
 
 ## Safety checks kept from the inspiration plugin
 
