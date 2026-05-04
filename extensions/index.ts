@@ -11,6 +11,8 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { resolve } from "node:path";
 
 type PermissionMode = string;
@@ -68,6 +70,8 @@ interface PiSettingsConfig {
     customModes?: ModeDefinition[];
   };
 }
+
+const execFileAsync = promisify(execFile);
 
 const DEFAULT_MODE: PermissionMode = "bypassPermissions";
 const PLAN_EXIT_PROMPT = "Plan mode ended. Execute the plan.";
@@ -194,6 +198,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   let previousActiveTools: string[] | null = null;
   let planContextPending = mode === "plan";
   let planExitTimer: ReturnType<typeof setTimeout> | null = null;
+  let netlockEnabledByExtension = false;
 
   const clearSessionAllows = () => {
     sessionAllow.tools.clear();
@@ -237,7 +242,23 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     }, 2000);
   };
 
-  const applyMode = (nextMode: PermissionMode, ctx: UiContext) => {
+  const setNetlock = async (enabled: boolean, ctx: UiContext) => {
+    if (!await commandExists("netlock")) return;
+    try {
+      await execFileAsync("sudo", ["netlock", enabled ? "on" : "off"], { timeout: 10_000 });
+      netlockEnabledByExtension = enabled;
+      ctx.ui.notify(`Netlock ${enabled ? "enabled" : "disabled"}`, "info");
+    } catch (error) {
+      ctx.ui.notify(`Failed to ${enabled ? "enable" : "disable"} netlock: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    }
+  };
+
+  const syncNetlockForMode = (nextMode: PermissionMode, ctx: UiContext) => {
+    if (nextMode === "safeBypass" && !netlockEnabledByExtension) void setNetlock(true, ctx);
+    if (mode === "safeBypass" && nextMode !== "safeBypass") void setNetlock(false, ctx);
+  };
+
+  const applyMode = async (nextMode: PermissionMode, ctx: UiContext) => {
     const wasPlan = mode === "plan";
     const enteringPlan = nextMode === "plan" && !wasPlan;
     const leavingPlan = wasPlan && nextMode !== "plan";
@@ -251,6 +272,8 @@ export default async function permissionExtension(pi: ExtensionAPI) {
       cancelPlanExitTimer();
       if (hasLatestPlanExitPrompt(ctx)) ctx.abort?.();
     }
+
+    syncNetlockForMode(nextMode, ctx);
 
     mode = nextMode;
     clearSessionAllows();
@@ -291,6 +314,8 @@ export default async function permissionExtension(pi: ExtensionAPI) {
       planContextPending = false;
     }
 
+    if (mode === "safeBypass") void setNetlock(true, ctx);
+
     updateStatus(ctx);
   });
 
@@ -298,7 +323,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     description: `Cycle permission mode (${shiftTabModes.map((m) => getModeMeta(m, modes).label).join(" → ")})`,
     handler: async (ctx) => {
       const idx = shiftTabModes.findIndex((m) => m === mode);
-      applyMode(shiftTabModes[(idx + 1) % shiftTabModes.length]!, ctx);
+      await applyMode(shiftTabModes[(idx + 1) % shiftTabModes.length]!, ctx);
     },
   });
 
@@ -313,7 +338,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
       const options = modes.map((m) => `${m.label} — ${m.description}`);
       const selected = await ctx.ui.select("Select permission mode", options);
       const idx = selected ? options.indexOf(selected) : -1;
-      if (idx >= 0) applyMode(modes[idx]!.id, ctx);
+      if (idx >= 0) await applyMode(modes[idx]!.id, ctx);
     },
   });
 
@@ -411,6 +436,15 @@ async function readJson<T>(path: string): Promise<T | Record<string, never>> {
     return JSON.parse(await readFile(path, "utf-8"));
   } catch {
     return {};
+  }
+}
+
+async function commandExists(command: string): Promise<boolean> {
+  try {
+    await execFileAsync("sh", ["-c", `command -v ${command}`]);
+    return true;
+  } catch {
+    return false;
   }
 }
 

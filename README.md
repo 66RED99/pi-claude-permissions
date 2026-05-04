@@ -116,6 +116,7 @@ A safer bypass mode intended for local app debugging.
 - Blocks common GitHub mutation commands, package publishing, and `git push`.
 - Allows network-ish bash commands only when they target localhost on port `3000` or `8080`, or a read-only GitHub operation.
 - Sends the mode `description` to the model as permission context, so custom modes can explain their rules.
+- If a `netlock` command exists, entering `safeBypass` runs `sudo netlock on`; leaving `safeBypass` runs `sudo netlock off`.
 
 ## Shortcut and command
 
