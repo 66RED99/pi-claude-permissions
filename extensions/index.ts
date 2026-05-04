@@ -19,6 +19,7 @@ type UiContext = {
   ui: any;
   hasUI?: boolean;
   isIdle?: () => boolean;
+  abort?: () => void;
   hasPendingMessages?: () => boolean;
   sessionManager?: { getEntries?: () => Array<any> };
 };
@@ -144,6 +145,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   let mode = normalizeMode(config.mode, defaultMode);
   let previousActiveTools: string[] | null = null;
   let planContextPending = mode === "plan";
+  let planExitTimer: ReturnType<typeof setTimeout> | null = null;
 
   const clearSessionAllows = () => {
     sessionAllow.tools.clear();
@@ -166,6 +168,26 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     ctx.ui.setStatus("permissions", `${meta.status} ${meta.label}`);
   };
 
+  const cancelPlanExitTimer = () => {
+    if (!planExitTimer) return;
+    clearTimeout(planExitTimer);
+    planExitTimer = null;
+  };
+
+  const schedulePlanExecution = (ctx: UiContext) => {
+    cancelPlanExitTimer();
+    planExitTimer = setTimeout(() => {
+      planExitTimer = null;
+      if (mode !== "plan"
+        && ctx.isIdle?.() === true
+        && ctx.hasPendingMessages?.() !== true
+        && hasPriorAssistantResponse(ctx)
+      ) {
+        pi.sendUserMessage(PLAN_EXIT_PROMPT);
+      }
+    }, 2000);
+  };
+
   const applyMode = (nextMode: PermissionMode, ctx: UiContext) => {
     const wasPlan = mode === "plan";
     const enteringPlan = nextMode === "plan" && !wasPlan;
@@ -174,6 +196,11 @@ export default async function permissionExtension(pi: ExtensionAPI) {
       && ctx.isIdle?.() === true
       && ctx.hasPendingMessages?.() !== true
       && hasPriorAssistantResponse(ctx);
+
+    if (nextMode === "plan") {
+      cancelPlanExitTimer();
+      if (hasLatestPlanExitPrompt(ctx)) ctx.abort?.();
+    }
 
     mode = nextMode;
     clearSessionAllows();
@@ -192,10 +219,11 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     }
 
     updateStatus(ctx);
-    if (shouldExecutePlan) pi.sendUserMessage(PLAN_EXIT_PROMPT);
+    if (shouldExecutePlan) schedulePlanExecution(ctx);
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    cancelPlanExitTimer();
     clearSessionAllows();
 
     if (pi.getFlag("dangerously-skip-permissions") === true) {
@@ -399,9 +427,31 @@ function isSessionAllowed(toolName: string, input: Record<string, unknown>, sess
 }
 
 function hasPriorAssistantResponse(ctx: UiContext): boolean {
-  return ctx.sessionManager?.getEntries?.().some((entry) =>
-    entry?.type === "message" && entry.message?.role === "assistant",
-  ) === true;
+  const entries = ctx.sessionManager?.getEntries?.() ?? [];
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry?.type !== "message") continue;
+    return entry.message?.role === "assistant";
+  }
+  return false;
+}
+
+function hasLatestPlanExitPrompt(ctx: UiContext): boolean {
+  const entries = ctx.sessionManager?.getEntries?.() ?? [];
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry?.type !== "message") continue;
+    return entry.message?.role === "user" && getMessageText(entry.message?.content) === PLAN_EXIT_PROMPT;
+  }
+  return false;
+}
+
+function getMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => typeof part?.text === "string" ? part.text : "")
+    .join("");
 }
 
 function isSafePlanCommand(command: string): boolean {
