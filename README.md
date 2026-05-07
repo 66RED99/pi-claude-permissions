@@ -15,11 +15,11 @@ This is heavily based on and inspired by [`rHedBull/pi-permissions`](https://git
   - `plan`
   - `acceptEdits`
   - `bypassPermissions`
-  - `safeBypass`
 - **Custom modes** via `piClaudePermissions.customModes`.
 - **No `fullAuto` mode**.
 - **`bypassPermissions` is the startup default**.
 - **Configurable `Shift+Tab` cycle**.
+- Optional **`hideDefaultMode`** status hiding for your default mode.
 - **`/permissions` always shows all modes** for manual selection.
 - Includes a custom **plan mode**.
 
@@ -62,6 +62,7 @@ Allowed tools:
 - `fd`
 - `bat`
 - `eza`
+- `mcp` for servers listed in `piClaudePermissions.planModeAllowedMcpServers`
 
 Blocked in plan mode:
 
@@ -76,7 +77,7 @@ When entering plan mode, the extension notifies:
 In plan mode, only read files/search tools are allowed.
 ```
 
-It also injects visible planning instructions into the next agent turn so the model knows to inspect only and produce a detailed plan.
+It also injects concise visible planning instructions into the next agent turn so the model knows to inspect only and produce a clear plan.
 
 When leaving plan mode, the extension notifies:
 
@@ -84,13 +85,7 @@ When leaving plan mode, the extension notifies:
 Plan mode ended
 ```
 
-If you leave plan mode while the agent is idle, the latest message is from the assistant, and this session has already received the plan-mode instruction message, it waits 2 seconds and then sends this user message automatically:
-
-```text
-Plan mode ended. Execute the plan.
-```
-
-If you cycle back into plan mode within those 2 seconds, the pending execute message is cancelled. If the execute message already started and you cycle back into plan mode, the extension aborts the current run like pressing Escape.
+It does not automatically send an execute message when you exit plan mode with `Shift+Tab`. Instead, the next agent turn receives a visible `PLAN MODE ENDED` context message so the model knows it can execute under the active permission mode.
 
 ### `acceptEdits`
 
@@ -104,26 +99,12 @@ If you cycle back into plan mode within those 2 seconds, the pending execute mes
 - Still blocks catastrophic commands and protected paths.
 - This is the default mode.
 
-### `safeBypass`
-
-A safer bypass mode intended for local app debugging.
-
-- Allows normal operations without confirmation.
-- Still blocks catastrophic commands and protected paths.
-- Allows writes only inside the current working directory or its parent directory.
-- Blocks `git push`.
-- Blocks PR creation and mutation commands like `gh pr create` / `gh pr merge`.
-- Blocks common GitHub mutation commands, package publishing, and `git push`.
-- Allows network-ish bash commands only when they target localhost on port `3000` or `8080`, or a read-only GitHub operation.
-- Sends the mode `description` to the model as permission context, so custom modes can explain their rules.
-- If a `netlock` command exists, entering `safeBypass` runs `sudo netlock on`; leaving `safeBypass` runs `sudo netlock off`.
-
 ## Shortcut and command
 
 By default, `Shift+Tab` cycles all modes:
 
 ```text
-default → plan → acceptEdits → bypassPermissions → safeBypass → default
+default → plan → acceptEdits → bypassPermissions → default
 ```
 
 Use `/permissions` to manually select any mode at any time. If you rarely use one of the modes, set `piClaudePermissions.shiftTabOptions` to keep your `Shift+Tab` cycle faster; `/permissions` will still show all modes.
@@ -136,8 +117,10 @@ Set this in `~/.pi/agent/settings.json` or project-local `.pi/settings.json`:
 {
   "piClaudePermissions": {
     "defaultMode": "bypassPermissions",
+    "hideDefaultMode": true,
     "allowCatastrophic": false,
-    "shiftTabOptions": ["default", "plan", "acceptEdits", "bypassPermissions", "safeBypass"],
+    "shiftTabOptions": ["default", "plan", "acceptEdits", "bypassPermissions"],
+    "planModeAllowedMcpServers": ["my-readonly-mcp"],
     "customModes": [
       {
         "id": "localOnly",
@@ -164,11 +147,15 @@ Set this in `~/.pi/agent/settings.json` or project-local `.pi/settings.json`:
 }
 ```
 
-`defaultMode` controls the startup mode and defaults to `bypassPermissions`. Valid values are any built-in or custom mode id. Built-ins are `default`, `plan`, `acceptEdits`, `bypassPermissions`, and `safeBypass`.
+`defaultMode` controls the startup mode and defaults to `bypassPermissions`. Valid values are any built-in or custom mode id. Built-ins are `default`, `plan`, `acceptEdits`, and `bypassPermissions`.
+
+`hideDefaultMode` defaults to `false`. When set to `true`, the footer/status label is hidden while the active mode is your configured `defaultMode` (for example, no persistent `Bypass Permissions` label when bypass is the default).
 
 `allowCatastrophic` defaults to `false`. When set to `true`, catastrophic command blocking and critical `rm -rf` detection are allowed. Protected path checks still run.
 
 `shiftTabOptions` defaults to all built-in and custom modes. Valid values are any built-in or custom mode id. This only changes the `Shift+Tab` cycle; `/permissions` still lists every mode.
+
+`planModeAllowedMcpServers` defaults to `[]`. In plan mode, MCP calls are only allowed when the call targets a server id in this list.
 
 `customModes` adds or overrides mode definitions. A custom mode can define a `policy` with:
 

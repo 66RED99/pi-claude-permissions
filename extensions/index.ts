@@ -5,14 +5,11 @@
  * - Shift+Tab cycles configurable modes.
  * - Default startup mode is bypassPermissions.
  * - Plan mode is read-only and injects planning instructions.
- * - Leaving plan mode for acceptEdits while idle asks the agent to execute.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { resolve } from "node:path";
 
 type PermissionMode = string;
@@ -21,10 +18,8 @@ type UiContext = {
   ui: any;
   hasUI?: boolean;
   isIdle?: () => boolean;
-  abort?: () => void;
   hasPendingMessages?: () => boolean;
   cwd?: string;
-  sessionManager?: { getEntries?: () => Array<any> };
 };
 
 interface SessionAllow {
@@ -59,6 +54,8 @@ interface PermissionsConfig {
   allowCatastrophic?: boolean;
   shiftTabOptions?: string[];
   defaultMode?: string;
+  hideDefaultMode?: boolean;
+  planModeAllowedMcpServers?: string[];
   customModes?: ModeDefinition[];
 }
 
@@ -67,14 +64,13 @@ interface PiSettingsConfig {
     allowCatastrophic?: boolean;
     shiftTabOptions?: string[];
     defaultMode?: string;
+    hideDefaultMode?: boolean;
+    planModeAllowedMcpServers?: string[];
     customModes?: ModeDefinition[];
   };
 }
 
-const execFileAsync = promisify(execFile);
-
 const DEFAULT_MODE: PermissionMode = "bypassPermissions";
-const PLAN_EXIT_PROMPT = "Plan mode ended. Execute the plan.";
 const PLAN_BLOCK_REASON = "You are in plan mode, you can only read files/search tools until the user exits plan mode.";
 
 const BUILT_IN_MODES: ModeDefinition[] = [
@@ -84,32 +80,7 @@ const BUILT_IN_MODES: ModeDefinition[] = [
   { id: "bypassPermissions", label: "Bypass Permissions", description: "Allow everything except catastrophic/protected operations", status: "⏵⏵⏵⏵" },
 ];
 
-const SAFE_BYPASS_MODE: ModeDefinition = {
-  id: "safeBypass",
-  label: "Safe Bypass",
-  description: "Allow local project work, block publishing and external network access",
-  status: "⏵⛨",
-  policy: {
-    excludedTools: [],
-    allowedWriteRoots: ["cwd", "parent"],
-    blockedBashPatterns: [
-      { pattern: "\\bgit\\s+push\\b", description: "git push is blocked in Safe Bypass" },
-      { pattern: "\\bgh\\s+pr\\s+create\\b", description: "PR creation is blocked in Safe Bypass" },
-      { pattern: "\\bpr\\s+create\\b", description: "PR creation is blocked in Safe Bypass" },
-      { pattern: "\\bgh\\s+pr\\s+(merge|close|edit|ready|reopen|lock|unlock)\\b", description: "PR mutation is blocked in Safe Bypass" },
-      { pattern: "\\bgh\\s+(repo|release|workflow|run|secret|variable|label|auth)\\s+(create|delete|edit|rename|transfer|archive|fork|upload|run|rerun|cancel|watch|unwatch|star|unstar|set|remove|login|logout|refresh)\\b", description: "GitHub mutation is blocked in Safe Bypass" },
-      { pattern: "\\bgh\\s+api\\b(?![^|;&]*\\b-X\\s+GET\\b)", description: "gh api is blocked unless it is explicitly read-only with -X GET" },
-      { pattern: "\\b(?:npm|pnpm|yarn|bun)\\s+publish\\b", description: "Package publishing is blocked in Safe Bypass" },
-    ],
-    network: {
-      allowLocalhostOnly: true,
-      allowGithubReadOnly: true,
-      allowedPorts: [3000, 8080],
-    },
-  },
-};
-
-const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "rg", "fd", "bat", "eza"];
+const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "rg", "fd", "bat", "eza", "mcp"];
 const GATED_TOOLS = new Set(["write", "edit", "bash"]);
 
 const SAFE_PLAN_BASH_PREFIXES = [
@@ -154,20 +125,13 @@ const DEFAULT_PROTECTED_PATHS = [
   "~/.netrc", "~/.npmrc", "~/.docker/config.json", "~/.kube/config", "~/.pi/agent/auth.json",
 ];
 
-const PLAN_MODE_MESSAGE = `[PLAN MODE ACTIVE]
-You are in plan mode — a read-only exploration mode for safe code analysis.
+const PLAN_MODE_MESSAGE = `[PLAN MODE]
+Read/search only. Do not edit files, write files, or run mutating commands.
 
-Restrictions:
-- You can only use: read, bash (read-only), grep, find, ls, rg, fd, bat, eza
-- You CANNOT use: edit, write, or any file modification tool
-- Bash is restricted to read-only commands (no >, >>, tee, sed -i, etc.)
+Inspect what you need, then give the user a clear plan with the files and changes involved. Wait for the user to toggle out of plan mode before executing.`;
 
-Instructions:
-- Produce a COMPLETE, DETAILED PLAN for the user's request before they exit plan mode.
-- Read and search files freely to understand the codebase.
-- Do NOT attempt to make any changes — just describe what you would do step by step.
-- The user will switch out of plan mode (Shift+Tab) when they are ready to execute the plan.
-- Be thorough: include file paths, function names, and specific changes needed.`;
+const PLAN_MODE_ENDED_MESSAGE = `[PLAN MODE ENDED]
+The user toggled out of plan mode. You may now execute the plan using the active permission mode.`;
 
 export default async function permissionExtension(pi: ExtensionAPI) {
   pi.registerFlag("permission-mode", {
@@ -192,13 +156,14 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   const allowCatastrophic = config.allowCatastrophic === true;
   const modes = buildModeDefinitions(config.customModes);
   const defaultMode = normalizeMode(config.defaultMode, DEFAULT_MODE, modes);
+  const hideDefaultMode = config.hideDefaultMode === true;
+  const planModeAllowedMcpServers = new Set(config.planModeAllowedMcpServers ?? []);
   const shiftTabModes = normalizeShiftTabOptions(config.shiftTabOptions, modes);
 
   let mode = normalizeMode(config.mode, defaultMode, modes);
   let previousActiveTools: string[] | null = null;
   let planContextPending = mode === "plan";
-  let planExitTimer: ReturnType<typeof setTimeout> | null = null;
-  let netlockEnabledByExtension = false;
+  let planEndedContextPending = false;
 
   const clearSessionAllows = () => {
     sessionAllow.tools.clear();
@@ -217,63 +182,19 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   };
 
   const updateStatus = (ctx: UiContext) => {
+    if (hideDefaultMode && mode === defaultMode) {
+      ctx.ui.setStatus("permissions", undefined);
+      return;
+    }
+
     const meta = getModeMeta(mode, modes);
     ctx.ui.setStatus("permissions", `${meta.status} ${meta.label}`);
-  };
-
-  const cancelPlanExitTimer = () => {
-    if (!planExitTimer) return;
-    clearTimeout(planExitTimer);
-    planExitTimer = null;
-  };
-
-  const schedulePlanExecution = (ctx: UiContext) => {
-    cancelPlanExitTimer();
-    planExitTimer = setTimeout(() => {
-      planExitTimer = null;
-      if (mode !== "plan"
-        && ctx.isIdle?.() === true
-        && ctx.hasPendingMessages?.() !== true
-        && hasPriorAssistantResponse(ctx)
-        && hasPlanModeContextMessage(ctx)
-      ) {
-        pi.sendUserMessage(PLAN_EXIT_PROMPT);
-      }
-    }, 2000);
-  };
-
-  const setNetlock = async (enabled: boolean, ctx: UiContext) => {
-    if (!await commandExists("netlock")) return;
-    try {
-      await execFileAsync("sudo", ["netlock", enabled ? "on" : "off"], { timeout: 10_000 });
-      netlockEnabledByExtension = enabled;
-      ctx.ui.notify(`Netlock ${enabled ? "enabled" : "disabled"}`, "info");
-    } catch (error) {
-      ctx.ui.notify(`Failed to ${enabled ? "enable" : "disable"} netlock: ${error instanceof Error ? error.message : String(error)}`, "warning");
-    }
-  };
-
-  const syncNetlockForMode = (nextMode: PermissionMode, ctx: UiContext) => {
-    if (nextMode === "safeBypass" && !netlockEnabledByExtension) void setNetlock(true, ctx);
-    if (mode === "safeBypass" && nextMode !== "safeBypass") void setNetlock(false, ctx);
   };
 
   const applyMode = async (nextMode: PermissionMode, ctx: UiContext) => {
     const wasPlan = mode === "plan";
     const enteringPlan = nextMode === "plan" && !wasPlan;
     const leavingPlan = wasPlan && nextMode !== "plan";
-    const shouldExecutePlan = leavingPlan
-      && ctx.isIdle?.() === true
-      && ctx.hasPendingMessages?.() !== true
-      && hasPriorAssistantResponse(ctx)
-      && hasPlanModeContextMessage(ctx);
-
-    if (nextMode === "plan") {
-      cancelPlanExitTimer();
-      if (hasLatestPlanExitPrompt(ctx)) ctx.abort?.();
-    }
-
-    syncNetlockForMode(nextMode, ctx);
 
     mode = nextMode;
     clearSessionAllows();
@@ -281,22 +202,22 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     if (enteringPlan || nextMode === "plan") {
       enterPlanToolScope();
       planContextPending = true;
+      planEndedContextPending = false;
       ctx.ui.notify("In plan mode, only read files/search tools are allowed.", "info");
     } else {
       if (leavingPlan) {
         restoreToolsAfterPlan();
         planContextPending = false;
+        planEndedContextPending = true;
         ctx.ui.notify("Plan mode ended", "info");
       }
       ctx.ui.notify(`Permission mode: ${getModeMeta(mode, modes).label}`, "info");
     }
 
     updateStatus(ctx);
-    if (shouldExecutePlan) schedulePlanExecution(ctx);
   };
 
   pi.on("session_start", async (_event, ctx) => {
-    cancelPlanExitTimer();
     clearSessionAllows();
 
     if (pi.getFlag("dangerously-skip-permissions") === true) {
@@ -313,8 +234,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
       restoreToolsAfterPlan();
       planContextPending = false;
     }
-
-    if (mode === "safeBypass") void setNetlock(true, ctx);
+    planEndedContextPending = false;
 
     updateStatus(ctx);
   });
@@ -354,6 +274,17 @@ export default async function permissionExtension(pi: ExtensionAPI) {
       };
     }
 
+    if (mode !== "plan" && planEndedContextPending) {
+      planEndedContextPending = false;
+      return {
+        message: {
+          customType: "plan-mode-ended-context",
+          content: PLAN_MODE_ENDED_MESSAGE,
+          display: true,
+        },
+      };
+    }
+
     const modeMeta = getModeMeta(mode, modes);
     if (!modeMeta.policy || !modeMeta.description) return;
     return {
@@ -368,7 +299,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     const toolName = event.toolName;
 
-    if (mode === "plan") return enforcePlanMode(toolName, event.input);
+    if (mode === "plan") return enforcePlanMode(toolName, event.input, planModeAllowedMcpServers);
     const modeMeta = getModeMeta(mode, modes);
     const customPolicy = modeMeta.policy;
     if (!customPolicy && mode !== "default" && !GATED_TOOLS.has(toolName)) return;
@@ -424,6 +355,14 @@ async function loadConfig(): Promise<PermissionsConfig> {
       ?? globalSettings.piClaudePermissions?.defaultMode
       ?? local.defaultMode
       ?? global.defaultMode),
+    hideDefaultMode: localSettings.piClaudePermissions?.hideDefaultMode
+      ?? globalSettings.piClaudePermissions?.hideDefaultMode
+      ?? local.hideDefaultMode
+      ?? global.hideDefaultMode,
+    planModeAllowedMcpServers: stringArrayOrUndefined(localSettings.piClaudePermissions?.planModeAllowedMcpServers)
+      ?? stringArrayOrUndefined(globalSettings.piClaudePermissions?.planModeAllowedMcpServers)
+      ?? stringArrayOrUndefined(local.planModeAllowedMcpServers)
+      ?? stringArrayOrUndefined(global.planModeAllowedMcpServers),
     customModes: localSettings.piClaudePermissions?.customModes
       ?? globalSettings.piClaudePermissions?.customModes
       ?? local.customModes
@@ -439,21 +378,18 @@ async function readJson<T>(path: string): Promise<T | Record<string, never>> {
   }
 }
 
-async function commandExists(command: string): Promise<boolean> {
-  try {
-    await execFileAsync("sh", ["-c", `command -v ${command}`]);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function stringOrUndefined(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function stringArrayOrUndefined(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return;
+  const strings = value.filter((item): item is string => typeof item === "string" && item.length > 0);
+  return strings.length > 0 ? strings : undefined;
+}
+
 function buildModeDefinitions(customModes: unknown): ModeDefinition[] {
-  const modes = [...BUILT_IN_MODES, SAFE_BYPASS_MODE];
+  const modes = [...BUILT_IN_MODES];
   if (!Array.isArray(customModes)) return modes;
 
   for (const customMode of customModes) {
@@ -504,7 +440,7 @@ function normalizeCustomModePolicy(raw: Record<string, any>): CustomModePolicy |
   return Object.keys(policy).length > 0 ? policy : undefined;
 }
 
-function normalizeMode(mode: unknown, fallback: PermissionMode = DEFAULT_MODE, modes: ModeDefinition[] = [...BUILT_IN_MODES, SAFE_BYPASS_MODE]): PermissionMode {
+function normalizeMode(mode: unknown, fallback: PermissionMode = DEFAULT_MODE, modes: ModeDefinition[] = BUILT_IN_MODES): PermissionMode {
   return parseMode(mode, modes) ?? fallback;
 }
 
@@ -527,11 +463,19 @@ function getModeMeta(mode: PermissionMode, modes: ModeDefinition[]) {
   return modes.find((m) => m.id === mode) ?? modes.find((m) => m.id === DEFAULT_MODE)!;
 }
 
-function enforcePlanMode(toolName: string, input: Record<string, unknown>) {
+function enforcePlanMode(toolName: string, input: Record<string, unknown>, allowedMcpServers: Set<string>) {
   if (!PLAN_MODE_TOOLS.includes(toolName)) return { block: true as const, reason: PLAN_BLOCK_REASON };
   if (toolName === "bash" && !isSafePlanCommand(String(input.command ?? ""))) {
     return { block: true as const, reason: PLAN_BLOCK_REASON };
   }
+  if (toolName === "mcp" && !isAllowedPlanModeMcpCall(input, allowedMcpServers)) {
+    return { block: true as const, reason: "MCP is only allowed in plan mode for servers listed in piClaudePermissions.planModeAllowedMcpServers." };
+  }
+}
+
+function isAllowedPlanModeMcpCall(input: Record<string, unknown>, allowedMcpServers: Set<string>): boolean {
+  const server = stringOrUndefined(input.server ?? input.connect);
+  return Boolean(server && allowedMcpServers.has(server));
 }
 
 function enforceCustomMode(toolName: string, input: Record<string, unknown>, ctx: UiContext, policy: CustomModePolicy) {
@@ -744,45 +688,6 @@ function isSessionAllowed(toolName: string, input: Record<string, unknown>, sess
   return sessionAllow.tools.has(toolName);
 }
 
-function hasPriorAssistantResponse(ctx: UiContext): boolean {
-  const entries = ctx.sessionManager?.getEntries?.() ?? [];
-  for (let index = entries.length - 1; index >= 0; index--) {
-    const entry = entries[index];
-    if (entry?.type !== "message") continue;
-    return entry.message?.role === "assistant";
-  }
-  return false;
-}
-
-function hasLatestPlanExitPrompt(ctx: UiContext): boolean {
-  const entries = ctx.sessionManager?.getEntries?.() ?? [];
-  for (let index = entries.length - 1; index >= 0; index--) {
-    const entry = entries[index];
-    if (entry?.type !== "message") continue;
-    return entry.message?.role === "user" && getMessageText(entry.message?.content) === PLAN_EXIT_PROMPT;
-  }
-  return false;
-}
-
-function hasPlanModeContextMessage(ctx: UiContext): boolean {
-  return (ctx.sessionManager?.getEntries?.() ?? []).some((entry) => {
-    if (entry?.type === "custom_message") {
-      return entry.customType === "plan-mode-context" && getMessageText(entry.content) === PLAN_MODE_MESSAGE;
-    }
-    if (entry?.type === "message" && entry.message?.role === "custom") {
-      return entry.message.customType === "plan-mode-context" && getMessageText(entry.message.content) === PLAN_MODE_MESSAGE;
-    }
-    return false;
-  });
-}
-
-function getMessageText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((part) => typeof part?.text === "string" ? part.text : "")
-    .join("");
-}
 
 function isSafePlanCommand(command: string): boolean {
   const trimmed = command.trim();
