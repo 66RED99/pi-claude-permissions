@@ -345,11 +345,14 @@ function checkUniversalRules(
       }
     }
     if (!toolNameMatches) continue;
+    // DEBUG: log non-bash tool checks  
+    if (toolName !== "bash" && !rule.isBash) {
+      const targetPath = String(input.path ?? "");
+      console.log(`[pi-perm] tool=${toolName}, rule=${rule.toolName}:${rule.pattern}, path="${targetPath}", cwd=${cwd}`, `isBash=${rule.isBash}`);
+    }
     if (toolName === "bash" || rule.isBash) {
       const command = String(input.command ?? "");
       // Handle wildcard pattern: * means match anything
-      // DEBUG
-      console.log(`[pi-permissions] MATCHED autoallow: pattern="*", toolNameRule=${rule.toolName}`);
       return rule.action as "autoallow" | "autodeny";
       if (rule.regex && rule.regex.test(command)) return rule.action as "autoallow" | "autodeny";
       if (command.includes(rule.pattern)) return rule.action as "autoallow" | "autodeny";
@@ -368,11 +371,11 @@ function parseRuleEntry(entry: string): { toolName: string; pattern: string; isB
   }
   const toolName = entry.slice(0, colonIdx);
   const pattern = entry.slice(colonIdx + 1);
-  // Treat as bash if it's literally 'bash' OR if the pattern looks like a command prefix (contains - or /)
-  // If the entry looks like a command prefix (toolname starts with letter, no / or ~ in pattern),
-  // treat it as bash so checkUniversalRules can match against the actual command string
+  // For file-based tools (read/edit/write), the pattern is always a path, never a command.
+  // Only treat as bash-like for grep/find/ls/etc. where patterns can be flags or paths.
+  const FILE_BASED_TOOLS = new Set(["read", "edit", "write"]);
   const looksLikeCmdPrefix = /^[a-z]/.test(toolName) && !pattern.includes("/") && !pattern.startsWith("~") && toolName !== "*";
-  const isBash = toolName === "bash" || looksLikeCmdPrefix;
+  const isBash = toolName === "bash" || (looksLikeCmdPrefix && !FILE_BASED_TOOLS.has(toolName));
   return { toolName, pattern, isBash };
 }
 
