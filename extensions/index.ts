@@ -1,10 +1,9 @@
 /**
- * Opinionated Permissions + Plan Mode for pi
+ * Opinionated Permissions for pi
  *
  * Inspired by rHedBull/pi-permissions, trimmed down for this workflow:
  * - Shift+Tab cycles configurable modes.
  * - Default startup mode is bypassPermissions.
- * - Plan mode is read-only and injects planning instructions.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -25,6 +24,21 @@ type UiContext = {
 interface SessionAllow {
   tools: Set<string>;
   commands: Set<string>;
+}
+
+interface ToolPermissionsConfig {
+  defaultAction?: "allow" | "deny";
+  autoallow?: string[];
+  autodeny?: string[];
+}
+
+// Compiled rule for autoallow/autodeny (applies in all modes)
+interface UniversalRule {
+  action: "autoallow" | "autodeny";
+  toolName: string;
+  pattern: string;
+  isBash: boolean;
+  regex: RegExp | null;
 }
 
 interface CustomModePolicy {
@@ -55,7 +69,6 @@ interface PermissionsConfig {
   shiftTabOptions?: string[];
   defaultMode?: string;
   hideDefaultMode?: boolean;
-  planModeAllowedMcpServers?: string[];
   customModes?: ModeDefinition[];
 }
 
@@ -65,38 +78,20 @@ interface PiSettingsConfig {
     shiftTabOptions?: string[];
     defaultMode?: string;
     hideDefaultMode?: boolean;
-    planModeAllowedMcpServers?: string[];
     customModes?: ModeDefinition[];
+    toolPermissions?: ToolPermissionsConfig;
   };
 }
 
 const DEFAULT_MODE: PermissionMode = "bypassPermissions";
-const PLAN_BLOCK_REASON = "You are in plan mode, you can only read files/search tools until the user exits plan mode.";
 
 const BUILT_IN_MODES: ModeDefinition[] = [
   { id: "default", label: "Default", description: "Ask before write/edit/bash operations", status: "⏵" },
-  { id: "plan", label: "Plan", description: "Read-only exploration; only read/search tools and safe bash", status: "⏸" },
   { id: "acceptEdits", label: "Accept Edits", description: "Allow write/edit silently, confirm bash", status: "⏵⏵" },
   { id: "bypassPermissions", label: "Bypass Permissions", description: "Allow everything except catastrophic/protected operations", status: "⏵⏵⏵⏵" },
 ];
 
-const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls", "rg", "fd", "bat", "eza", "mcp"];
 const GATED_TOOLS = new Set(["write", "edit", "bash"]);
-
-const SAFE_PLAN_BASH_PREFIXES = [
-  "cat", "head", "tail", "less", "more", "grep", "find", "ls",
-  "pwd", "echo", "printf", "wc", "sort", "uniq", "diff", "file",
-  "stat", "du", "df", "tree", "which", "whereis", "type", "env",
-  "printenv", "uname", "whoami", "id", "date", "cal", "uptime",
-  "ps", "top", "htop", "free", "curl", "jq", "sed", "awk",
-  "rg", "fd", "bat", "eza", "git status", "git log", "git diff",
-  "git show", "git branch", "git remote", "git ls-", "git config --get",
-  "gh pr view", "gh pr list", "gh pr diff", "gh pr checks", "gh pr status",
-  "gh issue view", "gh issue list", "gh issue status", "gh repo view",
-  "gh run view", "gh run list", "gh release view", "gh release list",
-  "gh api", "gh auth status", "npm list", "npm ls", "npm view",
-  "npm info", "npm search", "npm outdated", "npm audit",
-];
 
 const DEFAULT_DANGEROUS: Pattern[] = [
   { pattern: "chmod -R 777", description: "insecure recursive permissions" },
@@ -125,17 +120,22 @@ const DEFAULT_PROTECTED_PATHS = [
   "~/.netrc", "~/.npmrc", "~/.docker/config.json", "~/.kube/config", "~/.pi/agent/auth.json",
 ];
 
-const PLAN_MODE_MESSAGE = `[PLAN MODE]
-Read/search only. Do not edit files, write files, or run mutating commands.
-
-Inspect what you need, then give the user a clear plan with the files and changes involved. Wait for the user to toggle out of plan mode before executing.`;
-
-const PLAN_MODE_ENDED_MESSAGE = `[PLAN MODE ENDED]
-The user toggled out of plan mode. You may now execute the plan using the active permission mode.`;
+const DEFAULT_TOOL_PERMISSIONS: ToolPermissionsConfig = {
+  defaultAction: "deny",
+  autoallow: ["read:*"],
+  autodeny: [
+    "write:.env*",
+    "edit:.env*",
+    "read:.env*",
+    "write:*.*env*",
+    "edit:*.*env*",
+    "read:*.*env*",
+  ],
+};
 
 export default async function permissionExtension(pi: ExtensionAPI) {
   pi.registerFlag("permission-mode", {
-    description: "Permission mode (default, plan, acceptEdits, bypassPermissions)",
+    description: "Permission mode (default, acceptEdits, bypassPermissions)",
     type: "string",
     default: "",
   });
@@ -148,6 +148,9 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   const config = await loadConfig();
   const home = homedir();
   const sessionAllow: SessionAllow = { tools: new Set(), commands: new Set() };
+  const toolPermissions = await loadToolPermissions();
+
+  const autoDenyRules = compileUniversalRules(toolPermissions, "autodeny");
   const dangerousPatterns = config.dangerousPatterns ?? DEFAULT_DANGEROUS;
   const catastrophicPatterns = config.catastrophicPatterns ?? DEFAULT_CATASTROPHIC;
   const protectedPaths = (config.protectedPaths ?? DEFAULT_PROTECTED_PATHS).map((path) =>
@@ -157,28 +160,13 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   const modes = buildModeDefinitions(config.customModes);
   const defaultMode = normalizeMode(config.defaultMode, DEFAULT_MODE, modes);
   const hideDefaultMode = config.hideDefaultMode === true;
-  const planModeAllowedMcpServers = new Set(config.planModeAllowedMcpServers ?? []);
   const shiftTabModes = normalizeShiftTabOptions(config.shiftTabOptions, modes);
 
   let mode = normalizeMode(config.mode, defaultMode, modes);
-  let previousActiveTools: string[] | null = null;
-  let planContextPending = mode === "plan";
-  let planEndedContextPending = false;
 
   const clearSessionAllows = () => {
     sessionAllow.tools.clear();
     sessionAllow.commands.clear();
-  };
-
-  const restoreToolsAfterPlan = () => {
-    if (!previousActiveTools) return;
-    pi.setActiveTools(previousActiveTools);
-    previousActiveTools = null;
-  };
-
-  const enterPlanToolScope = () => {
-    if (!previousActiveTools) previousActiveTools = pi.getActiveTools();
-    pi.setActiveTools(PLAN_MODE_TOOLS);
   };
 
   const updateStatus = (ctx: UiContext) => {
@@ -192,28 +180,9 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   };
 
   const applyMode = async (nextMode: PermissionMode, ctx: UiContext) => {
-    const wasPlan = mode === "plan";
-    const enteringPlan = nextMode === "plan" && !wasPlan;
-    const leavingPlan = wasPlan && nextMode !== "plan";
-
     mode = nextMode;
     clearSessionAllows();
-
-    if (enteringPlan || nextMode === "plan") {
-      enterPlanToolScope();
-      planContextPending = true;
-      planEndedContextPending = false;
-      ctx.ui.notify("In plan mode, only read files/search tools are allowed.", "info");
-    } else {
-      if (leavingPlan) {
-        restoreToolsAfterPlan();
-        planContextPending = false;
-        planEndedContextPending = true;
-        ctx.ui.notify("Plan mode ended", "info");
-      }
-      ctx.ui.notify(`Permission mode: ${getModeMeta(mode, modes).label}`, "info");
-    }
-
+    ctx.ui.notify(`Permission mode: ${getModeMeta(mode, modes).label}`, "info");
     updateStatus(ctx);
   };
 
@@ -226,15 +195,6 @@ export default async function permissionExtension(pi: ExtensionAPI) {
       const flagMode = pi.getFlag("permission-mode");
       if (typeof flagMode === "string" && flagMode) mode = normalizeMode(flagMode, defaultMode, modes);
     }
-
-    if (mode === "plan") {
-      enterPlanToolScope();
-      planContextPending = true;
-    } else {
-      restoreToolsAfterPlan();
-      planContextPending = false;
-    }
-    planEndedContextPending = false;
 
     updateStatus(ctx);
   });
@@ -263,28 +223,6 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async () => {
-    if (mode === "plan" && planContextPending) {
-      planContextPending = false;
-      return {
-        message: {
-          customType: "plan-mode-context",
-          content: PLAN_MODE_MESSAGE,
-          display: true,
-        },
-      };
-    }
-
-    if (mode !== "plan" && planEndedContextPending) {
-      planEndedContextPending = false;
-      return {
-        message: {
-          customType: "plan-mode-ended-context",
-          content: PLAN_MODE_ENDED_MESSAGE,
-          display: true,
-        },
-      };
-    }
-
     const modeMeta = getModeMeta(mode, modes);
     if (!modeMeta.policy || !modeMeta.description) return;
     return {
@@ -299,7 +237,6 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     const toolName = event.toolName;
 
-    if (mode === "plan") return enforcePlanMode(toolName, event.input, planModeAllowedMcpServers);
     const modeMeta = getModeMeta(mode, modes);
     const customPolicy = modeMeta.policy;
     if (!customPolicy && mode !== "default" && !GATED_TOOLS.has(toolName)) return;
@@ -315,18 +252,222 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     });
     if (safetyBlock) return safetyBlock;
 
+    // Universal autodeny — always blocks regardless of mode
+    const denied = checkUniversalRules(toolName, event.input, autoDenyRules, ctx.cwd);
+    if (denied === "autodeny") {
+      return { block: true as const, reason: `Blocked by tool-permissions autodeny rule: ${toolName}` };
+    }
+
     if (customPolicy) return enforceCustomMode(toolName, event.input, ctx, customPolicy);
     if (mode === "bypassPermissions") return;
     if (mode === "acceptEdits" && (toolName === "write" || toolName === "edit")) return;
 
+    // Universal autoallow — reload from settings.json each time so live-updated rules take effect
+    const currentToolPermissions = await loadToolPermissions();
+    const currentAutoAllowRules = compileUniversalRules(currentToolPermissions, "autoallow");
+    const allowed = checkUniversalRules(toolName, event.input, currentAutoAllowRules, ctx.cwd);
+    if (allowed === "autoallow") return;
+
     if (isSessionAllowed(toolName, event.input, sessionAllow)) return;
 
+    // Default mode: always prompt for confirmation
+    if (mode === "default") {
+      if (!ctx.hasUI) {
+        return { block: true as const, reason: `Blocked ${toolName} (no UI for confirmation)` };
+      }
+      return promptApproval(toolName, event.input, ctx, dangerousPatterns, catastrophicPatterns, sessionAllow, allowCatastrophic);
+    }
+
+    // Fallback to defaultAction (deny by default)
+    if (toolPermissions.defaultAction === "allow") return;
     if (!ctx.hasUI) {
-      return { block: true as const, reason: `Blocked ${toolName} (no UI for confirmation, mode: ${mode})` };
+      return { block: true as const, reason: `Blocked ${toolName} (no UI for confirmation)` };
     }
 
     return promptApproval(toolName, event.input, ctx, dangerousPatterns, catastrophicPatterns, sessionAllow, allowCatastrophic);
   });
+}
+
+async function loadToolPermissions(): Promise<ToolPermissionsConfig> {
+  const globalSettingsPath = resolve(homedir(), ".pi/agent/settings.json");
+  const localSettingsPath = resolve(process.cwd(), ".pi/settings.json");
+  const gs = await readJson<PiSettingsConfig>(globalSettingsPath);
+  const ls = await readJson<PiSettingsConfig>(localSettingsPath);
+
+  const globalTp: ToolPermissionsConfig | undefined = gs?.piClaudePermissions?.toolPermissions ?? {};
+  const localTp: ToolPermissionsConfig | undefined = ls?.piClaudePermissions?.toolPermissions ?? {};
+
+  // Merge: local overrides global, falls back to DEFAULT_TOOL_PERMISSIONS
+  return {
+    defaultAction: localTp.defaultAction ?? globalTp.defaultAction ?? DEFAULT_TOOL_PERMISSIONS.defaultAction,
+    autoallow: (localTp.autoallow !== undefined ? localTp.autoallow : globalTp.autoallow) ?? DEFAULT_TOOL_PERMISSIONS.autoallow,
+    autodeny: (localTp.autodeny !== undefined ? localTp.autodeny : globalTp.autodeny) ?? DEFAULT_TOOL_PERMISSIONS.autodeny,
+  };
+}
+
+function compileUniversalRules(perms: ToolPermissionsConfig, action: "autoallow" | "autodeny"): UniversalRule[] {
+  const rules: UniversalRule[] = [];
+  const entries = perms[action] ?? [];
+
+  for (const entry of entries) {
+    const { toolName, pattern, isBash } = parseRuleEntry(entry);
+    rules.push({ action, toolName, pattern, isBash, regex: isBash ? safeRegex(pattern) : undefined });
+  }
+
+  return rules;
+}
+
+function checkUniversalRules(
+  toolName: string,
+  input: Record<string, unknown>,
+  universalRules: UniversalRule[],
+  cwd: string | undefined,
+): "autoallow" | "autodeny" | null {
+  const resolvedCwd = cwd ? resolve(cwd) : process.cwd();
+  // DEBUG: log all rules being checked
+  if (toolName === "bash") {
+    console.log(`[pi-permissions] checkUniversalRules tool=bash, cmd=${String(input.command ?? "").substring(0,80)}, rules=`, universalRules.map(r => ({t:r.toolName,p:r.pattern,isBash:r.isBash})));  }
+  for (const rule of universalRules) {
+    // For non-bash rules (like grep:*, find:*), also check if the first word of a bash command matches
+    let toolNameMatches = false;
+    if (rule.toolName === toolName) {
+      toolNameMatches = true;
+    } else if (
+      rule.toolName !== "*" &&
+      toolName === "bash"
+    ) {
+      // Check if the first word of the bash command matches this non-bash tool name
+      const cmdFirstWord = String(input.command ?? "").trim().split(/[\s]+/)[0];
+      console.log(`[pi-permissions] checking rule ${rule.toolName}:${rule.pattern}, isBash=${rule.isBash}, firstWord="${cmdFirstWord}"`);
+      if (rule.toolName === cmdFirstWord) {
+        toolNameMatches = true;
+        console.log(`[pi-permissions] first word matched!`);
+      }
+    }
+    if (!toolNameMatches) continue;
+    if (toolName === "bash" || rule.isBash) {
+      const command = String(input.command ?? "");
+      // Handle wildcard pattern: * means match anything
+      // DEBUG
+      console.log(`[pi-permissions] MATCHED autoallow: pattern="*", toolNameRule=${rule.toolName}`);
+      return rule.action as "autoallow" | "autodeny";
+      if (rule.regex && rule.regex.test(command)) return rule.action as "autoallow" | "autodeny";
+      if (command.includes(rule.pattern)) return rule.action as "autoallow" | "autodeny";
+    } else {
+      const targetPath = resolve(String(input.path ?? ""));
+      if (pathMatchesGlob(targetPath, rule.pattern, resolvedCwd)) return rule.action as "autoallow" | "autodeny";
+    }
+  }
+  return null;
+}
+
+function parseRuleEntry(entry: string): { toolName: string; pattern: string; isBash: boolean } {
+  const colonIdx = entry.indexOf(":");
+  if (colonIdx === -1) {
+    return { toolName: "*", pattern: entry, isBash: false };
+  }
+  const toolName = entry.slice(0, colonIdx);
+  const pattern = entry.slice(colonIdx + 1);
+  // Treat as bash if it's literally 'bash' OR if the pattern looks like a command prefix (contains - or /)
+  // If the entry looks like a command prefix (toolname starts with letter, no / or ~ in pattern),
+  // treat it as bash so checkUniversalRules can match against the actual command string
+  const looksLikeCmdPrefix = /^[a-z]/.test(toolName) && !pattern.includes("/") && !pattern.startsWith("~") && toolName !== "*";
+  const isBash = toolName === "bash" || looksLikeCmdPrefix;
+  return { toolName, pattern, isBash };
+}
+
+function safeRegex(pattern: string): RegExp | null {
+  try {
+    return new RegExp(`^${pattern}$`, "u");
+  } catch {
+    return null;
+  }
+}
+
+function pathMatchesGlob(path: string, pattern: string, cwd: string): boolean {
+  // Simple glob matching: * matches anything
+  if (pattern === "*") return true;
+  if (pattern === path) return true;
+  if (pattern.includes("**/")) {
+    const [prefix, suffix] = pattern.split("**/");
+    // ** at start means match anywhere in path
+    if (!prefix) {
+      return matchGlobSegment(path, suffix);
+    }
+    const prefixHasGlob = prefix.includes("*");
+    const suffixHasGlob = suffix.includes("*");
+    let searchStart = 0;
+    while (searchStart < path.length) {
+      const idx = path.indexOf("/" + prefix, searchStart);
+      if (idx === -1) break;
+      const afterPrefix = path.slice(idx + 1);
+      if (prefixHasGlob && suffixHasGlob) {
+        // Both have globs: check if any segment matches prefix AND ends with suffix
+        const segments = afterPrefix.split("/");
+        for (let i = 0; i < segments.length; i++) {
+          if (new RegExp('^' + prefix.replace(/\*/g, '.*') + '$').test(segments[i])) {
+            if (segments.slice(i).join('/').endsWith(suffix)) return true;
+          }
+        }
+      } else if (prefixHasGlob) {
+        // Only prefix has glob
+        const segments = afterPrefix.split("/");
+        for (let i = 0; i < segments.length; i++) {
+          if (new RegExp('^' + prefix.replace(/\*/g, '.*') + '$').test(segments[i])) {
+            return true;
+          }
+        }
+      } else if (suffixHasGlob) {
+        // Only suffix has glob
+        const segments = afterPrefix.split("/");
+        for (let i = 0; i < segments.length; i++) {
+          const segPath = segments.slice(i).join('/');
+          if (new RegExp('^' + suffix.replace(/\*/g, '.*') + '$').test(segPath)) return true;
+        }
+      } else {
+        // No globs in either
+        if (afterPrefix.endsWith(suffix)) return true;
+      }
+      searchStart = idx + 1;
+    }
+    return false;
+  }
+  // Handle glob patterns by converting to regex
+  try {
+    // Escape special regex chars except *
+    let esc = pattern.replace(/[.+?^$|(){}]/g, '\\$&');
+    // Replace * with .*
+    esc = esc.replace(/\*/g, '.*');
+    return new RegExp('^' + esc + '$').test(path);
+  } catch {
+    return false;
+  }
+}
+
+function matchGlobSegment(fullPath: string, pattern: string): boolean {
+  if (pattern === "*") return true;
+  // Special case: .env* matches any path containing ".env"
+  if (pattern.startsWith(".env")) {
+    const escapedPattern = pattern.slice(4).replace(/\*/g, '.*');
+    if (!escapedPattern) return fullPath.includes(".env");
+    // Match paths containing .env followed by the rest of the pattern
+    return new RegExp('\\.' + escapedPattern.replace(/^/, '')).test(fullPath);
+  }
+  const segments = fullPath.split("/");
+  for (const seg of segments) {
+    if (new RegExp('^' + pattern.replace(/\*/g, '.*') + '$').test(seg)) return true;
+  }
+  // Also check full path
+  if (new RegExp('^' + pattern.replace(/\*/g, '.*') + '$').test(fullPath)) return true;
+  // Check suffixes of segments (for .env* matching filename endings)
+  for (const seg of segments) {
+    const parts = seg.split(".");
+    if (parts.length > 1) {
+      const nameWithoutExt = parts.slice(0, -1).join(".");
+      if (new RegExp('^' + pattern.replace(/\*/g, '.*') + '$').test(nameWithoutExt)) return true;
+    }
+  }
+  return false;
 }
 
 async function loadConfig(): Promise<PermissionsConfig> {
@@ -359,10 +500,6 @@ async function loadConfig(): Promise<PermissionsConfig> {
       ?? globalSettings.piClaudePermissions?.hideDefaultMode
       ?? local.hideDefaultMode
       ?? global.hideDefaultMode,
-    planModeAllowedMcpServers: stringArrayOrUndefined(localSettings.piClaudePermissions?.planModeAllowedMcpServers)
-      ?? stringArrayOrUndefined(globalSettings.piClaudePermissions?.planModeAllowedMcpServers)
-      ?? stringArrayOrUndefined(local.planModeAllowedMcpServers)
-      ?? stringArrayOrUndefined(global.planModeAllowedMcpServers),
     customModes: localSettings.piClaudePermissions?.customModes
       ?? globalSettings.piClaudePermissions?.customModes
       ?? local.customModes
@@ -463,21 +600,6 @@ function getModeMeta(mode: PermissionMode, modes: ModeDefinition[]) {
   return modes.find((m) => m.id === mode) ?? modes.find((m) => m.id === DEFAULT_MODE)!;
 }
 
-function enforcePlanMode(toolName: string, input: Record<string, unknown>, allowedMcpServers: Set<string>) {
-  if (!PLAN_MODE_TOOLS.includes(toolName)) return { block: true as const, reason: PLAN_BLOCK_REASON };
-  if (toolName === "bash" && !isSafePlanCommand(String(input.command ?? ""))) {
-    return { block: true as const, reason: PLAN_BLOCK_REASON };
-  }
-  if (toolName === "mcp" && !isAllowedPlanModeMcpCall(input, allowedMcpServers)) {
-    return { block: true as const, reason: "MCP is only allowed in plan mode for servers listed in piClaudePermissions.planModeAllowedMcpServers." };
-  }
-}
-
-function isAllowedPlanModeMcpCall(input: Record<string, unknown>, allowedMcpServers: Set<string>): boolean {
-  const server = stringOrUndefined(input.server ?? input.connect);
-  return Boolean(server && allowedMcpServers.has(server));
-}
-
 function enforceCustomMode(toolName: string, input: Record<string, unknown>, ctx: UiContext, policy: CustomModePolicy) {
   if (policy.excludedTools?.includes(toolName)) {
     return { block: true as const, reason: `${toolName} is blocked in this permission mode.` };
@@ -532,9 +654,9 @@ function findBashPathBlock(command: string, ctx: UiContext, roots: CustomModePol
 
     const resolved = token.startsWith("~/") || token === "~"
       ? resolve(homedir(), token === "~" ? "" : token.slice(2))
-      : token.startsWith("/")
-        ? resolve(token)
-        : resolve(cwd, token);
+      : target.startsWith("/")
+        ? resolve(target)
+        : resolve(cwd, target);
 
     if (!allowedRoots.some((root) => resolved === root || resolved.startsWith(root + "/"))) {
       return `Bash path blocked outside allowed roots: ${token}`;
@@ -689,23 +811,6 @@ function isSessionAllowed(toolName: string, input: Record<string, unknown>, sess
 }
 
 
-function isSafePlanCommand(command: string): boolean {
-  const trimmed = command.trim();
-  if (!trimmed || />>/.test(trimmed) || /sed\s+.*-i/.test(trimmed)) return false;
-
-  for (const match of trimmed.matchAll(/>/g)) {
-    const idx = match.index!;
-    if (idx > 0 && trimmed[idx - 1] === "2" && trimmed.slice(idx + 1).startsWith("/dev/null")) continue;
-    return false;
-  }
-
-  if (["tee", "sponge", "dd"].some((cmd) => trimmed.includes(`| ${cmd}`) || trimmed.includes(`| sudo ${cmd}`))) {
-    return false;
-  }
-
-  return SAFE_PLAN_BASH_PREFIXES.some((prefix) => trimmed.startsWith(prefix) || trimmed.includes(`| ${prefix}`));
-}
-
 function checkCriticalRmRf(command: string): string | null {
   for (const pattern of rmRfPatterns()) {
     const match = command.match(pattern);
@@ -775,7 +880,7 @@ function resolveShellTarget(target: string, cwd: string): string {
   if (target === "~") return home;
   if (target.startsWith("~/")) return resolve(home, target.slice(2));
   if (target.startsWith("/")) return resolve(target);
-  return resolve(cwd, target);
+  return resolve(cwd, token);
 }
 
 function findMatch(command: string, patterns: Pattern[]): Pattern | undefined {
@@ -792,22 +897,159 @@ async function promptApproval(
   allowCatastrophic: boolean,
 ): Promise<{ block: true; reason: string } | undefined> {
   const { icon, description } = describeApprovalRequest(toolName, input, dangerousPatterns, catastrophicPatterns, allowCatastrophic);
-  const options = [
+
+  // Extract prefix for "add to autoallow" option (only for command-based tools)
+  let addPrefixOption: string | null = null;
+  if (toolName === "bash") {
+    const command = String(input.command ?? "");
+    const extracted = extractPrefix(toolName, command);
+    if (extracted) {
+      addPrefixOption = `Add prefix to autoallow → "${extracted}"`;
+    }
+  }
+
+  // Build options list — insert the prefix option before Deny
+  const baseOptions = [
     "Allow once",
     toolName === "bash" ? "Allow this command for session" : `Allow all ${toolName} for session`,
-    "Deny",
   ];
 
-  const choice = await ctx.ui.select(`${icon} ${description}`, options);
-  if (choice === options[0]) return;
+  let choice: string | undefined;
+  if (addPrefixOption) {
+    choice = await ctx.ui.select(`${icon} ${description}`, [
+      ...baseOptions,
+      addPrefixOption,
+      "Deny",
+    ]);
+  } else {
+    choice = await ctx.ui.select(`${icon} ${description}`, [...baseOptions, "Deny"]);
+  }
 
-  if (choice === options[1]) {
+  if (choice === baseOptions[0]) return;
+
+  // Handle "Add prefix to autoallow"
+  if (addPrefixOption && choice.startsWith("Add prefix")) {
+    const command = String(input.command ?? "");
+    const extracted = extractPrefix(toolName, command);
+    if (extracted) {
+      await persistAutoAllowRule(extracted);
+      ctx.ui.notify(`✅ Added autoallow rule: "${extracted}"`, "info");
+    }
+    return;
+  }
+
+  if (choice === baseOptions[1]) {
     if (toolName === "bash") sessionAllow.commands.add(String(input.command ?? ""));
     else sessionAllow.tools.add(toolName);
     return;
   }
 
   return { block: true, reason: `User denied ${toolName}` };
+}
+
+/** Extract a meaningful prefix from a command for autoallow rules.
+ * For bash commands like "grep -rn 'pattern' file" returns "grep:-r*"
+ * Returns tool + first compound flag (e.g., grep:-rn or find:*-name*.ts)
+ */
+function extractPrefix(toolName: string, command: string): string | null {
+  if (!command || !command.trim()) return null;
+
+  // Tokenize the command, respecting quoted strings
+  const tokens = tokenizeCommand(command);
+  if (tokens.length === 0) return null;
+
+  // For bash commands, extract the actual executable as tool name
+  let execTool = toolName;
+  let startIdx = 0;
+  if (toolName === "bash") {
+    const firstToken = stripQuotes(tokens[0]);
+    if (firstToken && !/^[\-]/.test(firstToken)) {
+      execTool = firstToken;
+      startIdx = 1;
+    }
+  }
+
+  // Find the first compound flag or meaningful arg
+  for (let i = startIdx; i < tokens.length; i++) {
+    const arg = stripQuotes(tokens[i]);
+    if (!arg) continue;
+
+    // Compound flags like -rn, --include=pattern → use as prefix (append * to match anything after)
+    if (/^-{1,2}\w+/.test(arg) && !/^-{1,2}\d+$/.test(arg)) {
+      return `${execTool}:${arg}:*`;
+    }
+
+    // Single-letter flag like -r → skip it and keep looking
+    if (/^-[a-zA-Z]$/.test(arg)) continue;
+
+    // First non-flag argument — too specific (file paths, patterns)
+    break;
+  }
+
+  // No compound flag found — return tool:* so user can add a broad autoallow rule
+  return `${execTool}:*`;
+}
+
+/** Tokenize a command string respecting quoted strings. */
+function tokenizeCommand(cmd: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let inQuote: '"' | "'" | null = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (inQuote) {
+      if (ch === inQuote) {
+        current += ch;
+        tokens.push(current);
+        current = "";
+        inQuote = null;
+      } else {
+        current += ch;
+      }
+    } else if (ch === '"' || ch === "'") {
+      if (current.length > 0) tokens.push(current);
+      current = ch;
+      inQuote = ch;
+    } else if (/\s/.test(ch)) {
+      if (current.length > 0) tokens.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  if (current.length > 0) tokens.push(current);
+  return tokens;
+}
+
+/** Strip surrounding quotes from a string. */
+function stripQuotes(s: string): string {
+  if (
+    s.length >= 2 &&
+    ((s[0] === '"' && s[s.length - 1] === '"') || (s[0] === "'" && s[s.length - 1] === "'"))
+  ) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
+/** Persist an autoallow rule to the global settings.json. */
+async function persistAutoAllowRule(rule: string): Promise<void> {
+  const path = resolve(homedir(), ".pi/agent/settings.json");
+  try {
+    const raw = await readFile(path, "utf-8");
+    const config = JSON.parse(raw) as PiSettingsConfig;
+    const perms = (config.piClaudePermissions ??= {}).toolPermissions ??= {};
+    const autoallow = (perms.autoallow ??= []);
+
+    // Avoid duplicates
+    if (autoallow.includes(rule)) return;
+
+    autoallow.push(rule);
+    config.piClaudePermissions.toolPermissions = perms;
+    await require("fs/promises").writeFile(path, JSON.stringify(config, null, 2) + "\n", "utf-8");
+  } catch {
+    // Silently fail — user can always add manually
+  }
 }
 
 function describeApprovalRequest(
