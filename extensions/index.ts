@@ -150,7 +150,7 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   const sessionAllow: SessionAllow = { tools: new Set(), commands: new Set() };
 
   // Infinite loop breaker — tracks consecutive identical bash commands
-  let lastCommand = "";
+  let lastCommandKey = "";
   let consecutiveCount = 0;
   const toolPermissions = await loadToolPermissions();
 
@@ -238,15 +238,16 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     };
   });
 
-  // Check for infinite loops: same bash command repeated 3+ times in a row
-  function checkLoopBreaker(command: string): { block: true; reason: string } | null {
-    if (command === lastCommand) {
+  // Check for infinite loops: same exact tool call repeated 3+ times in a row (bash, read, edit, write)
+  function checkLoopBreaker(toolName: string, commandOrPath: string): { block: true; reason: string } | null {
+    const key = `${toolName}:${commandOrPath}`;
+    if (key === lastCommandKey) {
       consecutiveCount++;
       if (consecutiveCount >= 3) {
-        return { block: true, reason: `Infinite loop detected: "${command}" repeated ${consecutiveCount} times in a row. You may be stuck — try a different approach.` };
+        return { block: true, reason: `Infinite loop detected: "${commandOrPath}" repeated ${consecutiveCount} times in a row. You may be stuck — try a different approach.` };
       }
     } else {
-      lastCommand = command;
+      lastCommandKey = key;
       consecutiveCount = 1;
     }
     return null;
@@ -276,13 +277,19 @@ export default async function permissionExtension(pi: ExtensionAPI) {
       return { block: true as const, reason: `Blocked by tool-permissions autodeny rule: ${toolName}` };
     }
 
-    // Loop breaker — only for bash commands
+    // Loop breaker — track all tools (bash, read, edit, write)
+    let trackedInput: string | null = null;
     if (toolName === "bash" && event.input?.command) {
-      const loopResult = checkLoopBreaker(String(event.input.command));
+      trackedInput = String(event.input.command);
+    } else if ((toolName === "read" || toolName === "edit" || toolName === "write") && event.input?.path) {
+      trackedInput = String(event.input.path);
+    }
+    if (trackedInput !== null) {
+      const loopResult = checkLoopBreaker(toolName, trackedInput);
       if (loopResult) return loopResult;
     } else {
-      // Non-bash tool resets the counter
-      lastCommand = "";
+      // Reset on unknown input shape or non-tracked tools
+      lastCommandKey = "";
       consecutiveCount = 0;
     }
 
