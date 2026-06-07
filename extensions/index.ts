@@ -278,19 +278,13 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     }
 
     // Loop breaker — track all tools (bash, read, edit, write)
-    let trackedInput: string | null = null;
+    // Non-tracked tools do NOT reset the counter; they are irrelevant to loop detection.
     if (toolName === "bash" && event.input?.command) {
-      trackedInput = String(event.input.command);
-    } else if ((toolName === "read" || toolName === "edit" || toolName === "write") && event.input?.path) {
-      trackedInput = String(event.input.path);
-    }
-    if (trackedInput !== null) {
-      const loopResult = checkLoopBreaker(toolName, trackedInput);
+      const loopResult = checkLoopBreaker(toolName, String(event.input.command));
       if (loopResult) return loopResult;
-    } else {
-      // Reset on unknown input shape or non-tracked tools
-      lastCommandKey = "";
-      consecutiveCount = 0;
+    } else if ((toolName === "read" || toolName === "edit" || toolName === "write") && event.input?.path) {
+      const loopResult = checkLoopBreaker(toolName, String(event.input.path));
+      if (loopResult) return loopResult;
     }
 
     if (customPolicy) return enforceCustomMode(toolName, event.input, ctx, customPolicy);
