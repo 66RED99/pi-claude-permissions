@@ -387,7 +387,7 @@ function checkUniversalRules(
       // Handle wildcard pattern: * means match anything
       if (rule.pattern === "*") return rule.action as "autoallow" | "autodeny";
       if (rule.regex && rule.regex.test(command)) return rule.action as "autoallow" | "autodeny";
-      if (command.includes(rule.pattern)) return rule.action as "autoallow" | "autodeny";
+      if (bashPatternMatches(command, rule.pattern)) return rule.action as "autoallow" | "autodeny";
     } else {
       const targetPath = resolve(String(input.path ?? ""));
       if (pathMatchesGlob(targetPath, rule.pattern, resolvedCwd)) return rule.action as "autoallow" | "autodeny";
@@ -411,11 +411,27 @@ function parseRuleEntry(entry: string): { toolName: string; pattern: string; isB
   return { toolName, pattern, isBash };
 }
 
+// Convert a glob-style pattern to an unanchored regex for bash command matching.
+// Escapes special regex chars except *, then converts * to .*
 function safeRegex(pattern: string): RegExp | null {
   try {
-    return new RegExp(`^${pattern}$`, "u");
+    const esc = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    return new RegExp(esc, "iu");
   } catch {
     return null;
+  }
+}
+
+// Check if a bash command matches a glob-style pattern (substring match).
+function bashPatternMatches(command: string, pattern: string): boolean {
+  // Literal wildcard — match anything
+  if (pattern === "*") return true;
+  const esc = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  try {
+    return new RegExp(esc, "iu").test(command);
+  } catch {
+    // Fallback to plain substring if regex somehow fails
+    return command.includes(pattern);
   }
 }
 
