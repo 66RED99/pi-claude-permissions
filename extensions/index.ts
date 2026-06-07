@@ -148,6 +148,10 @@ export default async function permissionExtension(pi: ExtensionAPI) {
   const config = await loadConfig();
   const home = homedir();
   const sessionAllow: SessionAllow = { tools: new Set(), commands: new Set() };
+
+  // Infinite loop breaker — tracks consecutive identical bash commands
+  let lastCommand = "";
+  let consecutiveCount = 0;
   const toolPermissions = await loadToolPermissions();
 
   const autoDenyRules = compileUniversalRules(toolPermissions, "autodeny");
@@ -234,6 +238,20 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     };
   });
 
+  // Check for infinite loops: same bash command repeated 3+ times in a row
+  function checkLoopBreaker(command: string): { block: true; reason: string } | null {
+    if (command === lastCommand) {
+      consecutiveCount++;
+      if (consecutiveCount >= 3) {
+        return { block: true, reason: `Infinite loop detected: "${command}" repeated ${consecutiveCount} times in a row. You may be stuck — try a different approach.` };
+      }
+    } else {
+      lastCommand = command;
+      consecutiveCount = 1;
+    }
+    return null;
+  }
+
   pi.on("tool_call", async (event, ctx) => {
     const toolName = event.toolName;
 
@@ -256,6 +274,16 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     const denied = checkUniversalRules(toolName, event.input, autoDenyRules, ctx.cwd);
     if (denied === "autodeny") {
       return { block: true as const, reason: `Blocked by tool-permissions autodeny rule: ${toolName}` };
+    }
+
+    // Loop breaker — only for bash commands
+    if (toolName === "bash" && event.input?.command) {
+      const loopResult = checkLoopBreaker(String(event.input.command));
+      if (loopResult) return loopResult;
+    } else {
+      // Non-bash tool resets the counter
+      lastCommand = "";
+      consecutiveCount = 0;
     }
 
     if (customPolicy) return enforceCustomMode(toolName, event.input, ctx, customPolicy);
