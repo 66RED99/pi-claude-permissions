@@ -83,6 +83,9 @@ interface PiSettingsConfig {
   };
 }
 
+// Module-level config error tracker — reported to user at session start when UI is available.
+const _configErrors: string[] = [];
+
 const DEFAULT_MODE: PermissionMode = "bypassPermissions";
 
 const BUILT_IN_MODES: ModeDefinition[] = [
@@ -201,6 +204,14 @@ export default async function permissionExtension(pi: ExtensionAPI) {
     }
 
     updateStatus(ctx);
+
+    // Report any config parse errors to the user at session start.
+    if (ctx.hasUI && _configErrors.length > 0) {
+      const message = `⚠️ Configuration warnings (${_configErrors.length}):
+${_configErrors.map((e, i) => `${i + 1}. ${e}`).join("\n")}`;
+      ctx.ui.notify(message, "warning");
+      _configErrors.length = 0; // Clear after showing
+    }
   });
 
   pi.registerShortcut("shift+tab", {
@@ -534,7 +545,10 @@ async function loadConfig(): Promise<PermissionsConfig> {
 async function readJson<T>(path: string): Promise<T | Record<string, never>> {
   try {
     return JSON.parse(await readFile(path, "utf-8"));
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    _configErrors.push(`Failed to parse config file: ${path} (${msg}). Falling back to defaults.`);
+    console.warn(`[pi-permissions]`, _configErrors[_configErrors.length - 1]);
     return {};
   }
 }
