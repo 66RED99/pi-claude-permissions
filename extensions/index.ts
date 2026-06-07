@@ -80,6 +80,9 @@ interface PiSettingsConfig {
     hideDefaultMode?: boolean;
     customModes?: ModeDefinition[];
     toolPermissions?: ToolPermissionsConfig;
+    protectedPaths?: string[];
+    dangerousPatterns?: Pattern[];
+    catastrophicPatterns?: Pattern[];
   };
 }
 
@@ -531,11 +534,28 @@ async function loadConfig(): Promise<PermissionsConfig> {
   const globalSettings = await readJson<PiSettingsConfig>(globalSettingsPath);
   const localSettings = await readJson<PiSettingsConfig>(localSettingsPath);
 
+  // Also check settings.json for patterns/protected paths (not just permissions.json)
+  const settingsProtectedPaths =
+    localSettings.piClaudePermissions?.protectedPaths
+    ?? globalSettings.piClaudePermissions?.protectedPaths;
+  const settingsDangerousPatterns =
+    localSettings.piClaudePermissions?.dangerousPatterns
+    ?? globalSettings.piClaudePermissions?.dangerousPatterns;
+  const settingsCatastrophicPatterns =
+    localSettings.piClaudePermissions?.catastrophicPatterns
+    ?? globalSettings.piClaudePermissions?.catastrophicPatterns;
+
   return {
     mode: stringOrUndefined(local.mode ?? global.mode),
-    dangerousPatterns: local.dangerousPatterns ?? global.dangerousPatterns ?? DEFAULT_DANGEROUS,
-    catastrophicPatterns: local.catastrophicPatterns ?? global.catastrophicPatterns ?? DEFAULT_CATASTROPHIC,
-    protectedPaths: local.protectedPaths ?? global.protectedPaths ?? DEFAULT_PROTECTED_PATHS,
+    dangerousPatterns:
+      (settingsDangerousPatterns as Pattern[] | undefined)
+      ?? local.dangerousPatterns ?? global.dangerousPatterns ?? DEFAULT_DANGEROUS,
+    catastrophicPatterns:
+      (settingsCatastrophicPatterns as Pattern[] | undefined)
+      ?? local.catastrophicPatterns ?? global.catastrophicPatterns ?? DEFAULT_CATASTROPHIC,
+    protectedPaths:
+      settingsProtectedPaths
+      ?? local.protectedPaths ?? global.protectedPaths ?? DEFAULT_PROTECTED_PATHS,
     allowCatastrophic: localSettings.piClaudePermissions?.allowCatastrophic
       ?? globalSettings.piClaudePermissions?.allowCatastrophic
       ?? false,
