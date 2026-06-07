@@ -388,7 +388,7 @@ function checkUniversalRules(
     if (toolName === "bash" || rule.isBash) {
       const command = String(input.command ?? "");
       // Handle wildcard pattern: * means match anything
-      return rule.action as "autoallow" | "autodeny";
+      if (rule.pattern === "*") return rule.action as "autoallow" | "autodeny";
       if (rule.regex && rule.regex.test(command)) return rule.action as "autoallow" | "autodeny";
       if (command.includes(rule.pattern)) return rule.action as "autoallow" | "autodeny";
     } else {
@@ -692,9 +692,9 @@ function findBashPathBlock(command: string, ctx: UiContext, roots: CustomModePol
 
     const resolved = token.startsWith("~/") || token === "~"
       ? resolve(homedir(), token === "~" ? "" : token.slice(2))
-      : target.startsWith("/")
-        ? resolve(target)
-        : resolve(cwd, target);
+      : token.startsWith("/")
+        ? resolve(token)
+        : resolve(cwd, token);
 
     if (!allowedRoots.some((root) => resolved === root || resolved.startsWith(root + "/"))) {
       return `Bash path blocked outside allowed roots: ${token}`;
@@ -918,7 +918,7 @@ function resolveShellTarget(target: string, cwd: string): string {
   if (target === "~") return home;
   if (target.startsWith("~/")) return resolve(home, target.slice(2));
   if (target.startsWith("/")) return resolve(target);
-  return resolve(cwd, token);
+  return resolve(cwd, target);
 }
 
 function findMatch(command: string, patterns: Pattern[]): Pattern | undefined {
