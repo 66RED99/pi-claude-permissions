@@ -128,7 +128,17 @@ const DEFAULT_PROTECTED_PATHS = [
 
 const DEFAULT_TOOL_PERMISSIONS: ToolPermissionsConfig = {
   defaultAction: "deny",
-  autoallow: ["read:*"],
+  autoallow: [
+    // Read-only tools
+    "read:*",
+    "web_search:*",
+    "fetch_content:*",
+    "code_search:*",
+    "recall:*",
+    "find:*",
+    "ls:*",
+    "ask_user_question:*",
+  ],
   autodeny: [
     "write:.env*",
     "edit:.env*",
@@ -580,8 +590,13 @@ async function loadConfig(): Promise<PermissionsConfig> {
 
 async function readJson<T>(path: string): Promise<T | Record<string, never>> {
   try {
-    return JSON.parse(await readFile(path, "utf-8"));
+    const content = await readFile(path, "utf-8");
+    return JSON.parse(content);
   } catch (err) {
+    // Silently ignore missing files — they're optional config sources
+    if (err && typeof err === "object" && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
+      return {};
+    }
     const msg = err instanceof Error ? err.message : String(err);
     _configErrors.push(`Failed to parse config file: ${path} (${msg}). Falling back to defaults.`);
     console.warn(`[pi-permissions]`, _configErrors[_configErrors.length - 1]);
@@ -993,10 +1008,11 @@ async function promptApproval(
     choice = await ctx.ui.select(`${icon} ${description}`, [
       ...baseOptions,
       addPrefixOption,
-      "Deny",
+      "Explain & Deny",
+      "Just Deny",
     ]);
   } else {
-    choice = await ctx.ui.select(`${icon} ${description}`, [...baseOptions, "Deny"]);
+    choice = await ctx.ui.select(`${icon} ${description}`, [...baseOptions, "Explain & Deny", "Just Deny"]);
   }
 
   if (choice === baseOptions[0]) return;
@@ -1018,7 +1034,16 @@ async function promptApproval(
     return;
   }
 
-  return { block: true, reason: `User denied ${toolName}` };
+  // Handle denial — prompt for custom reason on "Explain & Deny"
+  let denyReason = `User denied ${toolName}`;
+  if (choice === "Explain & Deny" && ctx.hasUI) {
+    const reasonInput = await ctx.ui.input("Why are you denying this?", "e.g., wrong approach, better way exists...");
+    if (reasonInput?.trim()) {
+      denyReason = `User denied ${toolName}: ${reasonInput.trim()}`;
+    }
+  }
+
+  return { block: true, reason: denyReason };
 }
 
 /** Extract a meaningful prefix from a command for autoallow rules.
