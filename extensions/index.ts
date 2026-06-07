@@ -359,9 +359,7 @@ function checkUniversalRules(
   cwd: string | undefined,
 ): "autoallow" | "autodeny" | null {
   const resolvedCwd = cwd ? resolve(cwd) : process.cwd();
-  // DEBUG: log all rules being checked
-  if (toolName === "bash") {
-    console.log(`[pi-permissions] checkUniversalRules tool=bash, cmd=${String(input.command ?? "").substring(0,80)}, rules=`, universalRules.map(r => ({t:r.toolName,p:r.pattern,isBash:r.isBash})));  }
+
   for (const rule of universalRules) {
     // For non-bash rules (like grep:*, find:*), also check if the first word of a bash command matches
     let toolNameMatches = false;
@@ -373,18 +371,12 @@ function checkUniversalRules(
     ) {
       // Check if the first word of the bash command matches this non-bash tool name
       const cmdFirstWord = String(input.command ?? "").trim().split(/[\s]+/)[0];
-      console.log(`[pi-permissions] checking rule ${rule.toolName}:${rule.pattern}, isBash=${rule.isBash}, firstWord="${cmdFirstWord}"`);
       if (rule.toolName === cmdFirstWord) {
         toolNameMatches = true;
-        console.log(`[pi-permissions] first word matched!`);
       }
     }
     if (!toolNameMatches) continue;
-    // DEBUG: log non-bash tool checks  
-    if (toolName !== "bash" && !rule.isBash) {
-      const targetPath = String(input.path ?? "");
-      console.log(`[pi-perm] tool=${toolName}, rule=${rule.toolName}:${rule.pattern}, path="${targetPath}", cwd=${cwd}`, `isBash=${rule.isBash}`);
-    }
+
     if (toolName === "bash" || rule.isBash) {
       const command = String(input.command ?? "");
       // Handle wildcard pattern: * means match anything
